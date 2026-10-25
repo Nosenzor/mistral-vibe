@@ -37,6 +37,12 @@ Accepted decisions from the design session (2026-10-24):
   main model's context window or system prompt, and the main model's
   compaction never affects it.
 
+Adversarial implementation-readiness review (2026-10-25): completed by an
+independent reviewer against the repo conventions and the source. Findings —
+wire-method naming, interruption semantics, review timeouts, `steerable`'s
+role, permission-bypass disclosure, and subagent visibility — are folded into
+this revision.
+
 ## 2. Problem
 
 A single model working a turn has no second opinion. It can drift off the
@@ -114,7 +120,9 @@ Current adjacent behavior, source-confirmed:
   the duck sees which concerns are still open, judges whether newer steps
   addressed them, and closes them. Delivered steers are recorded here so the
   duck knows what landed.
-- Constraints: the harness is an external dependency (ADR 0014 version skew);
+- Constraints: the harness is an external dependency whose version skew
+  app-server code must tolerate (the same discipline ADR 0014 applies to the
+  client/backend boundary);
   new agent behavior belongs in an app-server feature module (ADR 0018);
   server-owned behavior ships behind app-server methods/notifications, with the
   TUI only rendering (ADR 0002, ADR 0009, ADR 0016); config changes follow
@@ -141,7 +149,7 @@ single event subscription per active backend and fans events out in
 | Slash commands are declared in one registry | `vibe/cli-rust/src/commands/commands.rs:35` (`/model`) | Source-confirmed | `/peer` registers alongside `/model` |
 | Feature prompts live as markdown in `vibe/core/prompts/` | `vibe/core/prompts/session_title.md`, `vision_describe.md` | Source-confirmed | The duck's critic prompt ships as `peer_review.md` |
 | Post-hoc file review is a different feature (checkpoint-based change review) | `vibe/core/review/manager.py` | Source-confirmed | Out of scope; no reuse |
-| Read-only builtins exist with no-prompt permission: `read_file` (ALWAYS), `grep` (ALWAYS); web tools `web_search` / `web_fetch` are ASK; `task` (subagents) is ASK | `vibe/core/tools/builtins/read_file.py:43`, `grep.py:17`, `web_search.py:26`, `web_fetch.py:53`, `task.py:31` | Source-confirmed | The duck's allowlist reuses these tool classes; web tools are auto-approved for the duck behind `allow_web_tools`; `task` is excluded |
+| Read-only builtins exist with no-prompt permission: `read_file` (ALWAYS), `grep` (ALWAYS); web tools `web_search` / `web_fetch` are ASK; `task` (subagents) is ASK | `vibe/core/tools/builtins/read_file.py:43`, `grep.py:17`, `web_search.py:26`, `web_fetch.py:53`, `task.py:31` | Source-confirmed | The duck's allowlist reuses these tool classes; web tools are auto-approved for the duck behind `allow_web_tools` (a flagged ADR 0004 deviation, see 7.8); `read_file`'s `sensitive_patterns` gate is denied for the duck, not bypassed; `task` is excluded |
 
 ## 7. Proposed Design
 
@@ -159,7 +167,7 @@ running turn with `turn/steer`; the panel also offers a manual per-critique
 
 Normal path: user runs `/peer glm-5.3` (or config sets `[utility_models] peer`)
 → session starts a turn → `turn/started` arms the duck and resets the budget
-→ each `history/entry/added` is mirrored and coalesced → the duck model is
+→ each `history/entryAdded` is mirrored and coalesced → the duck model is
 called with the critic prompt + the turn's user message + the bounded mirror →
 `peer/review` (running) then `peer/review` (complete, verdict + text) → TUI
 panel renders it → if auto-steer is on and severity crosses the threshold,
@@ -181,7 +189,11 @@ the text is steered into the turn → `turn/completed` retires the duck.
   delivered) and *dismiss*. When closed, the main chat reclaims the width.
 - **Auto-steer** (`peer_review.auto_steer`, default `false`): when on,
   reviews with `severity >= peer_review.auto_steer_severity` (default
-  `critical`) are injected automatically; the panel marks them "delivered".
+  `critical`) **and** `steerable=true` are injected automatically; the panel
+  marks them "delivered". `steerable` is the duck's own judgment that
+  injecting the critique would help the running turn, and gates auto-steer
+  only — the manual *steer main* action is always offered while the turn
+  runs, regardless of `steerable`.
 - **Degraded states:** peer provider errors mark the review failed and silence
   the duck for the rest of the turn; the main turn is unaffected. Budget
   exhaustion silences reviews but keeps the panel. A steer that arrives after
@@ -192,7 +204,7 @@ the text is steered into the turn → `turn/completed` retires the duck.
 
 ```mermaid
 flowchart LR
-    Harness["Unified Harness (agent loop)"] -->|"turn/started, history/entry/added, turn/completed"| Tap
+    Harness["Unified Harness (agent loop)"] -->|"turn/started, history/entryAdded, turn/completed"| Tap
     Tap["Server event tap (server.py fan-out)"] --> Controller["PeerReviewController (vibe/app_server/_peer_review.py)"]
     Controller -->|"bounded mirror"| Mirror["Per-session transcript mirror"]
     Controller -->|"create_backend(provider)"| LLM["Duck model completion (vibe/core/llm)"]
@@ -232,7 +244,7 @@ New wire shapes (all camelCase `ProtocolModel`s, `extra="forbid"`):
   (`info` | `warning` | `critical`, nullable while running), `steerable`
   (bool), `delivered` (bool), `text` (string), `error` (string, nullable).
   Emitted twice per review (running → complete), mirroring
-  `history/entry/added` + `history/entry/updated`.
+  `history/entryAdded` + `history/entryUpdated`.
 - **`peer/configure`** — params `session_id`, `model` (string, nullable),
   `auto_steer` (bool, nullable); response `PeerConfigView` (`enabled`,
   `model`, `auto_steer`, `max_reviews_per_turn`, `auto_steer_severity`).
@@ -276,16 +288,34 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 - One controller per active root session, created on backend activation and
   cancelled on backend switch/shutdown (`cancel_tasks`, `_execution.py`).
 - Per-turn state machine: `idle → armed (turn/started) → reviewing ⇄ coalescing
-  → retired (turn/completed | turn/interrupted)`.
+  → retired (turn/completed, any status)`. Interruption surfaces as
+  `turn/completed` with turn status `interrupted` (there is no separate
+  `turn/interrupted` notification); the controller distinguishes the two by
+  turn status. Retirement stops new reviews; an in-flight review is cancelled
+  when the turn ended by interruption, and allowed to finish (bounded by the
+  review timeout) when the turn completed normally, so the final critique
+  still displays with steer actions disabled.
 - Coalescing: entries arriving while a review is in flight batch into the next
   review (trailing edge); at most one review in flight per session.
 - Tool rounds are serialized inside a review (one round at a time) and capped
   by `max_tool_rounds`; a review with exhausted rounds still returns its
   verdict from whatever evidence it gathered.
-- Budget decrements per completed review attempt (success or failure), per
-  turn.
-- Mirror bounds: the last N entries (default 40) plus the turn's original user
-  message, token-capped; images stripped from the mirror (text-only review).
+- Budget decrements per completed review attempt (success, failure, or
+  timeout), per turn.
+- Each review attempt is bounded by a per-review timeout
+  (`PEER_REVIEW_TIMEOUT_SECONDS`, a controller constant, default 30s) so a
+  hung peer call cannot stall the duck: on timeout the controller emits a
+  terminal `peer/review` (`failed`), counts the attempt against the budget,
+  and silences the duck for the rest of the turn, like a provider error.
+  Cancellation (interrupt, backend switch) likewise emits a terminal `failed`
+  notification so the panel never shows a review stuck at `running`.
+- Mirror bounds: the last N entries (`PEER_MIRROR_MAX_ENTRIES = 40`, a
+  controller constant, not config) plus the turn's original user message,
+  token-capped; images stripped from the mirror (text-only review). The
+  ledger cap is likewise a controller constant (`PEER_LEDGER_MAX_CONCERNS =
+  10`). The mirror covers root-session material only: when the main model
+  runs `task`, the duck sees the tool call and result in the root transcript,
+  not the child session's internal turns.
 - The duck's context is independent of the main model's: the main model's
   compaction, context window size, and system prompt never affect it. The
   duck's own context is bounded — the mirror is a sliding window and the
@@ -303,10 +333,11 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | Failure point | Caller result | Durable state | Recovery or retry |
 | :--- | :--- | :--- | :--- |
 | Peer provider error mid-review | `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms; no automatic retry within the turn |
+| Peer call hangs (no response, no error) | Review fails at `PEER_REVIEW_TIMEOUT_SECONDS`; terminal `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms |
 | Peer model alias unknown | `peer/configure` fails with a typed validation error; config warns at load | Override not applied | User picks a valid alias |
 | Budget exhausted | Panel shows "budget reached" | Counter persists for the turn | Resets on next `turn/started` |
 | Steer rejected (turn ended) | Review stays displayed, `delivered=false` | Review record kept in panel | Manual re-steer disabled; user can paste the text |
-| Turn interrupted | In-flight peer call cancelled | Mirror kept; duck re-arms on next turn | `turn/started` of the next turn |
+| Turn interrupted | In-flight peer call cancelled; terminal `peer/review` (`failed`) emitted | Mirror kept; duck re-arms on next turn | `turn/started` of the next turn |
 | Backend switch/shutdown | Controller cancelled | Nothing persisted | New session creates a fresh controller |
 | Malformed duck output | Fallback parse: plain text, `severity=info`, `steerable=false` | Review still delivered | None needed |
 | Duck tool call fails (missing file, network error) | Error text fed back to the duck as the tool result; review continues | Review record kept | Duck may retry within the round cap |
@@ -344,16 +375,23 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 - **Security:** the duck receives a fixed read-only tool allowlist — no
   write/edit/shell tools, no `task` (subagents), no credentials beyond its
   provider's — so it cannot modify the workspace, execute commands, or
-  escalate permissions. File tools run against the session workspace with the
-  same read visibility the main model has. Steer injection is a user-role
-  message, which the main model treats as untrusted input like any user
-  message.
+  escalate permissions. File tools run against the session workspace; reads
+  that would trip `read_file`'s `sensitive_patterns` approval gate are
+  **denied** for the duck — there is no interactive approval path for a
+  background peer — so the duck's read visibility is the main model's minus
+  sensitive files. Auto-approving the ASK-gated web tools behind
+  `allow_web_tools` (default `true`) is a deliberate deviation from ADR
+  0004's rule that side effects honor declared permissions: the duck is
+  non-interactive, so ASK cannot be surfaced. The mitigations are the
+  read-only allowlist, per-query visibility in the panel, and the
+  `allow_web_tools` kill switch. Steer injection is a user-role message,
+  which the main model treats as untrusted input like any user message.
 
 ## 8. Implementation Plan
 
 | Slice | Behavior proved | Owner and likely files | Exit criteria |
 | :--- | :--- | :--- | :--- |
-| 1. Config | `[utility_models] peer` + `[peer_review]` group (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`) load, merge, validate, and resolve via `get_utility_model(PEER)` | `vibe/core/config/models.py`, `vibe_schema.py`, `_config_introspect.py`; tests under `tests/core/config/` | New keys round-trip through layers; unknown alias warns; pyright + unit tests pass |
+| 1. Config | `[utility_models] peer` + `[peer_review]` group (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`) load, merge, validate, and resolve via `get_utility_model(PEER)` | `vibe/core/config/models.py`, `vibe_schema.py`, `_defaults.py`; tests under `tests/core/config/` | New keys round-trip through layers; unknown alias warns; pyright + unit tests pass |
 | 2. Protocol | `peer/review` notification + `peer/configure` / `peer/read` / `peer/steer` RPCs validate on the wire and dispatch | `vibe/app_server/protocol.py`, `events.py`, `server.py` dispatch; contract tests | Malformed payloads rejected with typed errors; methods route to the module |
 | 3. Controller + tool loop | Event tap → mirror → coalesced peer call with read-only tool loop → notification; budget; steer on threshold; read-only allowlist enforced | `vibe/app_server/_peer_review.py`, `vibe/core/prompts/peer_review.md`, `PeerToolExecutor` port; unit tests with `FakeBackend` | Fake-driven tests cover coalescing, budget, failure silence, steer trigger, interrupt cancel, tool-round cap, and refusal of non-allowlisted tools |
 | 4. Session plumbing | `/peer` override lands in the session `OverridesLayer`; runtime derivation resolves the peer model; controller lifecycle follows backend activation | `vibe/app_server/_session_model.py` pattern, `_runtime.py`, `server.py` wiring | Session override survives reload, dies with the session; derivation test |
@@ -385,6 +423,7 @@ repository changes.
 | Mirror + coalescing: burst of entries yields one review | Unit | `tests/app_server/test_peer_review.py` with `FakeBackend` | One peer call per burst; mirror bounded |
 | Budget: N+1-th review is skipped | Unit | same | `budget_exhausted` telemetry; panel note |
 | Peer error silences duck for the turn, main turn unaffected | Unit / Integration | same + server dispatch test | `peer/review` failed; turn completes normally |
+| Hung peer call fails at the review timeout | Unit | same | Terminal `failed` emitted; attempt counted against budget |
 | Auto-steer injects only at/above threshold | Unit | same | Steer port called with marked message |
 | Steer after turn end marked not delivered | Unit | same | `delivered=false`; no exception |
 | Interrupt cancels in-flight peer call | Unit | same | Task cancelled; duck re-arms next turn |
