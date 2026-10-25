@@ -290,7 +290,7 @@ class AppServer:
         self._connector_catalog_service = connector_catalog_service
         self._plugin_catalog_service = plugin_catalog_service
         self._imports_service = imports_service
-        self._peer_review = PeerReviewController()
+        self._peer_review = PeerReviewController(notify=self._notify)
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
             raise TypeError(
