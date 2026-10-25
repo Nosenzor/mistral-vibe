@@ -238,6 +238,8 @@ mod paste_path;
 mod paste_path_list;
 #[path = "units/paste_probe.rs"]
 mod paste_probe;
+#[path = "units/peer.rs"]
+mod peer;
 #[path = "units/pending_commands.rs"]
 mod pending_commands;
 #[path = "units/plugins.rs"]

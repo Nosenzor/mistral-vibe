@@ -61,6 +61,7 @@ pub mod option_list;
 pub mod paste_files;
 pub mod paste_image;
 pub mod paste_path;
+pub mod peer;
 pub mod platform;
 pub mod plugins;
 pub mod pointer;

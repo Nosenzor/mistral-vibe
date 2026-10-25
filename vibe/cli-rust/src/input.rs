@@ -50,6 +50,11 @@ fn is_ctrl_backslash(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
 }
 
+/// Ctrl+P toggles the peer review panel.
+fn is_ctrl_p(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p')
+}
+
 #[cfg(unix)]
 pub fn request_suspend(app: &mut App, key: &KeyEvent) -> bool {
     let requested = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z');
@@ -162,6 +167,10 @@ pub fn handle_priority_key(app: &mut App, client: &Arc<Client>, key: KeyEvent) -
         debug_console::toggle(app, client);
         return Some(false);
     }
+    if is_ctrl_p(&key) {
+        crate::commands::peer::toggle_panel(app, client);
+        return Some(false);
+    }
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
             KeyCode::Up => scroll_chat(app, true, KEY_SCROLL_STEP),
@@ -250,6 +259,40 @@ fn handle_key_inner(
             }
             // App-level bindings still run while the list is focused.
             KeyCode::Esc => {}
+            KeyCode::Char('o') if ctrl => {}
+            _ => return false,
+        }
+    }
+    // The peer panel owns navigation and its actions while focused; other
+    // keys are swallowed, and Esc falls through to unfocus or close.
+    if app.peer.focused {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = key.modifiers.is_empty();
+        let nav_key = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        ) || (plain && matches!(key.code, KeyCode::Char('j') | KeyCode::Char('k')));
+        match key.code {
+            _ if nav_key => {
+                crate::peer::nav_key(app, &key);
+                return false;
+            }
+            KeyCode::Enter if plain => {
+                crate::commands::peer::steer_selected(app, client);
+                return false;
+            }
+            KeyCode::Char('d') if plain => {
+                app.peer.dismiss_selected();
+                return false;
+            }
+            // Esc unfocuses or closes via the ladder below.
+            KeyCode::Esc => {}
+            // App-level bindings still run while the panel is focused.
             KeyCode::Char('o') if ctrl => {}
             _ => return false,
         }
@@ -415,6 +458,7 @@ fn handle_key_inner(
             app.overlays.last_escape = Some(std::time::Instant::now());
         }
         // Only a docked panel owns Esc; a dropped column must not swallow the interrupt.
+        KeyCode::Esc if app.peer.escape() => {}
         KeyCode::Esc if app.todo_sidebar.close() => {}
         // Escape while generating interrupts the turn.
         KeyCode::Esc if matches!(app.session.status, Status::Generating { .. }) => {

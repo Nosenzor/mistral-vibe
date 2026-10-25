@@ -252,8 +252,9 @@ fn dispatch_key(
     match app.focus() {
         // Handled above, before the priority keys.
         Focus::Trust => {}
-        // A docked plan panel closes before Esc rejects the tool or question the turn waits on.
-        Focus::Approval | Focus::Question if esc && app.todo_sidebar.close() => {}
+        // A docked panel closes before Esc rejects the tool or question the turn waits on.
+        Focus::Approval | Focus::Question
+            if esc && (app.peer.escape() || app.todo_sidebar.close()) => {}
         Focus::Approval => crate::approval::handle_key(app, client, key),
         Focus::Question => crate::question_input::handle_key(app, client, key),
         Focus::Config => config::handle_key(app, client, config_tx, key),

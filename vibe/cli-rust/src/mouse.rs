@@ -63,6 +63,7 @@ pub enum MouseTarget {
     BottomBar,
     TodoRow,
     TodoSidebar,
+    PeerPanel,
     OnboardingThemeList,
     OnboardingPreview,
     OnboardingLinks,
@@ -263,6 +264,14 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         MouseTarget::Trust => crate::trust_folders::wheel(app, up),
         MouseTarget::TodoSidebar => {
             let scroll = &mut app.todo_sidebar.scroll;
+            *scroll = if up {
+                scroll.saturating_sub(MOUSE_SCROLL_STEP as usize)
+            } else {
+                scroll.saturating_add(MOUSE_SCROLL_STEP as usize)
+            };
+        }
+        MouseTarget::PeerPanel => {
+            let scroll = &mut app.peer.scroll;
             *scroll = if up {
                 scroll.saturating_sub(MOUSE_SCROLL_STEP as usize)
             } else {

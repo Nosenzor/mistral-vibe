@@ -89,6 +89,12 @@ pub(super) fn dispatch(
             }
         }
         MouseTarget::TodoSidebar => {}
+        // A click in the peer panel focuses it and selects the review under the pointer.
+        MouseTarget::PeerPanel => {
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                crate::peer::click_row(app, event.row);
+            }
+        }
         // The console log body: the wheel scrolls it (loading older pages at
         // the top) and a click copies the log line. The
         // router keeps the pressed target wherever the pointer is released,
