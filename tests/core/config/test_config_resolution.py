@@ -246,6 +246,33 @@ class TestMouseCaptureConfig:
         assert orch.config.enable_mouse_capture is False
 
 
+class TestPeerReviewConfig:
+    @pytest.mark.asyncio
+    async def test_reads_peer_settings_from_toml(
+        self,
+        config_dir: Path,
+        make_orchestrator: Callable[
+            [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+        ],
+    ) -> None:
+        config_file = config_dir / "config.toml"
+        with config_file.open("rb") as f:
+            data = tomllib.load(f)
+        data["utility_models"] = {"peer": "duck-model"}
+        data["peer_review"] = {"max_reviews_per_turn": 5, "auto_steer": True}
+        with config_file.open("wb") as f:
+            tomli_w.dump(data, f)
+
+        orch = await make_orchestrator()
+
+        assert orch.config.utility_models.peer == "duck-model"
+        assert orch.config.peer_review.max_reviews_per_turn == 5
+        assert orch.config.peer_review.auto_steer is True
+        # Shallow merge: keys the layer did not set keep their defaults.
+        assert orch.config.peer_review.max_tool_rounds == 4
+        assert orch.config.peer_review.allow_web_tools is True
+
+
 class TestSystemTrustStoreConfig:
     @pytest.mark.asyncio
     async def test_build_configures_ssl_context_from_toml(

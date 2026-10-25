@@ -74,6 +74,7 @@ class UtilityFeature(StrEnum):
 
     TITLE = "title"
     SMART_APPROVE = "smart_approve"
+    PEER = "peer"
 
 
 # The ``[utility_models]`` value that selects the session's active model.
@@ -87,6 +88,7 @@ class UtilityModelsConfig(BaseSettings):
 
     title: str = ""
     smart_approve: str = ""
+    peer: str = ""
 
     def alias_for(self, feature: UtilityFeature) -> str:
         match feature:
@@ -94,6 +96,8 @@ class UtilityModelsConfig(BaseSettings):
                 return self.title.strip()
             case UtilityFeature.SMART_APPROVE:
                 return self.smart_approve.strip()
+            case UtilityFeature.PEER:
+                return self.peer.strip()
 
     def configured(self) -> list[tuple[UtilityFeature, str]]:
         """Features with a non-empty override."""
@@ -102,6 +106,30 @@ class UtilityModelsConfig(BaseSettings):
             for feature in UtilityFeature
             if (alias := self.alias_for(feature))
         ]
+
+
+class PeerSeverity(StrEnum):
+    """Critique severity; auto-steer fires at or above the configured level."""
+
+    INFO = "info"
+    WARNING = "warning"
+    CRITICAL = "critical"
+
+    @property
+    def rank(self) -> int:
+        return list(PeerSeverity).index(self)
+
+
+class PeerReviewConfig(BaseSettings):
+    """Rubber-duck peer review settings (the ``[peer_review]`` group)."""
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    max_reviews_per_turn: int = Field(default=10, ge=1)
+    max_tool_rounds: int = Field(default=4, ge=0)
+    auto_steer: bool = False
+    auto_steer_severity: PeerSeverity = PeerSeverity.CRITICAL
+    allow_web_tools: bool = True
 
 
 class SessionLoggingConfig(BaseSettings):

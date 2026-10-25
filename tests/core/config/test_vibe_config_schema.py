@@ -16,6 +16,8 @@ import tomli_w
 from vibe.core.config import (
     MissingAPIKeyError,
     ModelConfig,
+    PeerReviewConfig,
+    PeerSeverity,
     ProviderConfig,
     UtilityFeature,
 )
@@ -1349,3 +1351,98 @@ async def test_a_non_positive_context_window_is_reported_as_a_validation_error(
             )
 
     assert "max_context_length" in str(exc_info.value)
+
+
+def test_peer_utility_model_resolves_via_get_utility_model() -> None:
+    models = [
+        ModelConfig(name="model-a", provider="mistral", alias="a"),
+        ModelConfig(name="model-b", provider="mistral", alias="b"),
+    ]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "active_model": "b",
+        "utility_models": {"peer": "a"},
+    })
+
+    peer = config.get_utility_model(UtilityFeature.PEER)
+
+    assert peer is not None
+    assert peer.alias == "a"
+    assert config.validation_warnings == ()
+
+
+def test_unknown_peer_utility_model_emits_validation_warning() -> None:
+    models = [ModelConfig(name="model-a", provider="mistral", alias="a")]
+    config = VibeConfigSchema.model_validate({
+        "models": models,
+        "utility_models": {"peer": "does-not-exist"},
+    })
+
+    assert len(config.validation_warnings) == 1
+    assert "does-not-exist" in config.validation_warnings[0]
+    assert "'peer'" in config.validation_warnings[0]
+
+
+def test_peer_review_group_defaults_and_overrides() -> None:
+    config = VibeConfigSchema.model_validate({})
+
+    assert config.peer_review == PeerReviewConfig()
+    assert config.peer_review.max_reviews_per_turn == 10
+    assert config.peer_review.max_tool_rounds == 4
+    assert config.peer_review.auto_steer is False
+    assert config.peer_review.auto_steer_severity == PeerSeverity.CRITICAL
+    assert config.peer_review.allow_web_tools is True
+
+    tuned = VibeConfigSchema.model_validate({
+        "peer_review": {
+            "max_reviews_per_turn": 3,
+            "max_tool_rounds": 0,
+            "auto_steer": True,
+            "auto_steer_severity": "warning",
+            "allow_web_tools": False,
+        }
+    })
+
+    assert tuned.peer_review.max_reviews_per_turn == 3
+    assert tuned.peer_review.max_tool_rounds == 0
+    assert tuned.peer_review.auto_steer is True
+    assert tuned.peer_review.auto_steer_severity == PeerSeverity.WARNING
+    assert tuned.peer_review.allow_web_tools is False
+
+
+def test_peer_review_group_rejects_out_of_range_values() -> None:
+    with pytest.raises(ValidationError, match="max_reviews_per_turn"):
+        VibeConfigSchema.model_validate({"peer_review": {"max_reviews_per_turn": 0}})
+
+    with pytest.raises(ValidationError, match="max_tool_rounds"):
+        VibeConfigSchema.model_validate({"peer_review": {"max_tool_rounds": -1}})
+
+    with pytest.raises(ValidationError, match="auto_steer_severity"):
+        VibeConfigSchema.model_validate({
+            "peer_review": {"auto_steer_severity": "fatal"}
+        })
+
+
+def test_peer_model_same_as_active_emits_validation_warning() -> None:
+    models = [ModelConfig(name="model-a", provider="mistral", alias="a")]
+    same_alias = VibeConfigSchema.model_validate({
+        "models": models,
+        "active_model": "a",
+        "utility_models": {"peer": "a"},
+    })
+    active_selector = VibeConfigSchema.model_validate({
+        "models": models,
+        "active_model": "a",
+        "utility_models": {"peer": "active"},
+    })
+
+    assert len(same_alias.validation_warnings) == 1
+    assert "'peer'" in same_alias.validation_warnings[0]
+    assert len(active_selector.validation_warnings) == 1
+    assert "'peer'" in active_selector.validation_warnings[0]
+
+
+def test_peer_severity_rank_orders_info_below_critical() -> None:
+    assert (
+        PeerSeverity.INFO.rank < PeerSeverity.WARNING.rank < PeerSeverity.CRITICAL.rank
+    )
