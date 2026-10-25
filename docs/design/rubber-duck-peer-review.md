@@ -26,6 +26,11 @@ Accepted decisions from the design session (2026-10-24):
   Runtime/Core (harness) changes.
 - **UI:** a side panel (split view) in the Rust TUI, chosen from three layout
   options in a visual review.
+- **Duck tool use:** read-only. The duck may read and search files and search
+  or fetch the web to ground its critiques in evidence. It cannot write, edit,
+  or run shell commands, and it cannot spawn subagents — if a critique would
+  benefit from a subagent, the duck recommends it and the main model or the
+  user decides.
 
 ## 2. Problem
 
@@ -50,8 +55,12 @@ Current adjacent behavior, source-confirmed:
   injected into the running turn so the main model hears them.
 - The duck can reference the user's original instructions and keep the main
   model on plan.
-- The duck is advisory only: it gets no tools and cannot act on the workspace.
-- Cost is bounded: a configurable per-turn budget caps peer completions.
+- The duck is advisory only: it cannot modify the workspace or execute
+  commands. It may use a fixed read-only toolset (file read/search, web
+  search/fetch) so its critiques are grounded in evidence rather than
+  speculation.
+- Cost is bounded: a configurable per-turn budget caps peer completions, and a
+  per-review tool-round cap bounds tool use inside each completion.
 - The main turn is never blocked or failed by duck errors.
 
 ## 4. Non-Goals
@@ -59,7 +68,11 @@ Current adjacent behavior, source-confirmed:
 - No harness (Unified Harness Core/Runtime) changes. In-loop peering, streaming
   token visibility, and pre-execution tool gating are a possible future
   deepening, not this version.
-- The duck cannot call tools, edit files, or spawn subagents.
+- The duck cannot write or edit files, run shell commands, or spawn subagents.
+  Its toolset is a fixed read-only allowlist (section 5); it never receives
+  approval-gated write tools, and the `task` (subagent) tool is excluded by
+  design — the duck recommends subagents in its critique instead of running
+  them.
 - No ACP-specific rendering of critiques in v1; the `peer/review` notification
   is on the wire, but only the Rust TUI renders it.
 - No cross-session duck memory; each session's duck starts fresh.
@@ -78,6 +91,11 @@ Current adjacent behavior, source-confirmed:
   `turn/steer` RPC.
 - **Budget:** max reviews per turn (`peer_review.max_reviews_per_turn`,
   default 10).
+- **Read-only toolset:** the duck's fixed tool allowlist — `read_file`,
+  `grep`, `web_search`, `web_fetch` — executed against the session workspace.
+  Web tools are gated by `peer_review.allow_web_tools` (default `true`) and
+  their queries are shown in the panel. Write/edit/shell/subagent tools are
+  never in the allowlist.
 - Constraints: the harness is an external dependency (ADR 0014 version skew);
   new agent behavior belongs in an app-server feature module (ADR 0018);
   server-owned behavior ships behind app-server methods/notifications, with the
@@ -105,6 +123,7 @@ single event subscription per active backend and fans events out in
 | Slash commands are declared in one registry | `vibe/cli-rust/src/commands/commands.rs:35` (`/model`) | Source-confirmed | `/peer` registers alongside `/model` |
 | Feature prompts live as markdown in `vibe/core/prompts/` | `vibe/core/prompts/session_title.md`, `vision_describe.md` | Source-confirmed | The duck's critic prompt ships as `peer_review.md` |
 | Post-hoc file review is a different feature (checkpoint-based change review) | `vibe/core/review/manager.py` | Source-confirmed | Out of scope; no reuse |
+| Read-only builtins exist with no-prompt permission: `read_file` (ALWAYS), `grep` (ALWAYS); web tools `web_search` / `web_fetch` are ASK; `task` (subagents) is ASK | `vibe/core/tools/builtins/read_file.py:43`, `grep.py:17`, `web_search.py:26`, `web_fetch.py:53`, `task.py:31` | Source-confirmed | The duck's allowlist reuses these tool classes; web tools are auto-approved for the duck behind `allow_web_tools`; `task` is excluded |
 
 ## 7. Proposed Design
 
@@ -135,8 +154,10 @@ the text is steered into the turn → `turn/completed` retires the duck.
 - **`/peer`** with no argument shows current state; `/peer <model>` enables
   with that model for this session; `/peer off` disables. Mirrors `/model`.
 - **Panel:** a toggleable right-hand split panel. Header shows the duck model
-  and its provider, plus status ("reviewing step N", "budget reached",
-  "peer error: …"). Each
+  and its provider, plus status ("reviewing step N", "reading auth.py…",
+  "web search: …", "budget reached", "peer error: …"). While a review runs,
+  the panel shows the duck's read-only tool activity live, so its evidence
+  gathering is transparent. Each
   critique shows severity, target step, text, and actions: *steer main*
   (injects into the running turn; disabled once the turn ends or the review is
   delivered) and *dismiss*. When closed, the main chat reclaims the width.
@@ -157,6 +178,7 @@ flowchart LR
     Tap["Server event tap (server.py fan-out)"] --> Controller["PeerReviewController (vibe/app_server/_peer_review.py)"]
     Controller -->|"bounded mirror"| Mirror["Per-session transcript mirror"]
     Controller -->|"create_backend(provider)"| LLM["Duck model completion (vibe/core/llm)"]
+    Controller -->|"read-only tool calls"| Tools["PeerToolExecutor (read-only allowlist)"]
     Controller -->|"notify peer/review"| Notify["Server notification port"]
     Controller -->|"turn/steer"| Steer["Server steer port -> root backend"]
     Notify --> TUI["Rust TUI side panel"]
@@ -177,8 +199,10 @@ Ownership:
 - `vibe/core/llm` owns: the backend used for duck completions (unchanged).
 - The TUI owns: panel presentation, `/peer`, key toggle, local panel state.
 - Injected ports (ADR 0018 — narrow, no whole-server access): a config getter, a
-  backend-event tap registration, a notify port, a steer port, and a backend
-  factory. The controller never reaches into another feature's state.
+  backend-event tap registration, a notify port, a steer port, a backend
+  factory, and a `PeerToolExecutor` port that runs the read-only allowlist
+  against the session workspace. The controller never reaches into another
+  feature's state.
 
 ### 7.4 Contracts and Data
 
@@ -204,13 +228,22 @@ Config (layered, ADR 0005):
 - `[utility_models] peer = "glm-5.3"` — duck model alias; empty = off.
   `UtilityFeature.PEER` added; `get_utility_model(PEER)` resolves it.
 - `[peer_review]` group: `max_reviews_per_turn` (int, default 10, ge 1),
-  `auto_steer` (bool, default false), `auto_steer_severity`
-  (`info` | `warning` | `critical`, default `critical`).
+  `max_tool_rounds` (int, default 4, ge 0 — 0 means the duck may not use
+  tools), `auto_steer` (bool, default false), `auto_steer_severity`
+  (`info` | `warning` | `critical`, default `critical`), `allow_web_tools`
+  (bool, default true — when false, `web_search`/`web_fetch` are removed from
+  the duck's allowlist).
 
-Duck completion contract: no tools, `tool_choice="none"`, temperature from the
-peer `ModelConfig`, output parsed as a strict JSON verdict
+Duck completion contract: the duck model receives the read-only tool catalog
+(`read_file`, `grep`, and — when `allow_web_tools` — `web_search`,
+`web_fetch`) and the bounded transcript mirror. The controller runs a tool
+loop: each response's tool calls are executed through a `PeerToolExecutor`
+port against the session workspace, results are fed back, and the loop ends
+when the duck returns a final message or the per-review tool-round cap is hit.
+The final message is parsed as a strict JSON verdict
 (`{"severity": ..., "steerable": ..., "text": ...}`) with a tolerant fallback
-to plain text at `severity=info`.
+to plain text at `severity=info`. Temperature comes from the peer
+`ModelConfig`.
 
 Steer payload: a user-role message, text prefixed with a fixed marker
 (`[rubber duck] `) so the main model can attribute the source.
@@ -222,7 +255,10 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 - Per-turn state machine: `idle → armed (turn/started) → reviewing ⇄ coalescing
   → retired (turn/completed | turn/interrupted)`.
 - Coalescing: entries arriving while a review is in flight batch into the next
-  review (trailing edge); at most one peer call in flight per session.
+  review (trailing edge); at most one review in flight per session.
+- Tool rounds are serialized inside a review (one round at a time) and capped
+  by `max_tool_rounds`; a review with exhausted rounds still returns its
+  verdict from whatever evidence it gathered.
 - Budget decrements per completed review attempt (success or failure), per
   turn.
 - Mirror bounds: the last N entries (default 40) plus the turn's original user
@@ -245,6 +281,9 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | Turn interrupted | In-flight peer call cancelled | Mirror kept; duck re-arms on next turn | `turn/started` of the next turn |
 | Backend switch/shutdown | Controller cancelled | Nothing persisted | New session creates a fresh controller |
 | Malformed duck output | Fallback parse: plain text, `severity=info`, `steerable=false` | Review still delivered | None needed |
+| Duck tool call fails (missing file, network error) | Error text fed back to the duck as the tool result; review continues | Review record kept | Duck may retry within the round cap |
+| Duck emits a call to a non-allowlisted tool | Refused with an error result (the catalog only advertises allowlisted tools; the executor double-checks) | Review continues | None — defense in depth |
+| Tool-round cap hit mid-review | Verdict returned from gathered evidence | Review counted against budget | None |
 
 ### 7.7 Compatibility and Migration
 
@@ -270,18 +309,24 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   provider; crossing providers sends session content to a second provider —
   the config warning for `peer` naming a different provider than the main
   model covers this, and the panel header always shows the duck's provider.
-- **Security:** the duck receives no tools and no credentials beyond its
-  provider's; steer injection is a user-role message, which the main model
-  treats as untrusted input like any user message. The duck cannot escalate
-  permissions.
+  Duck web queries can contain session-derived search terms and go to the
+  configured search provider; `allow_web_tools=false` disables this, and every
+  query is shown in the panel.
+- **Security:** the duck receives a fixed read-only tool allowlist — no
+  write/edit/shell tools, no `task` (subagents), no credentials beyond its
+  provider's — so it cannot modify the workspace, execute commands, or
+  escalate permissions. File tools run against the session workspace with the
+  same read visibility the main model has. Steer injection is a user-role
+  message, which the main model treats as untrusted input like any user
+  message.
 
 ## 8. Implementation Plan
 
 | Slice | Behavior proved | Owner and likely files | Exit criteria |
 | :--- | :--- | :--- | :--- |
-| 1. Config | `[utility_models] peer` + `[peer_review]` group load, merge, validate, and resolve via `get_utility_model(PEER)` | `vibe/core/config/models.py`, `vibe_schema.py`, `_config_introspect.py`; tests under `tests/core/config/` | New keys round-trip through layers; unknown alias warns; pyright + unit tests pass |
+| 1. Config | `[utility_models] peer` + `[peer_review]` group (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`) load, merge, validate, and resolve via `get_utility_model(PEER)` | `vibe/core/config/models.py`, `vibe_schema.py`, `_config_introspect.py`; tests under `tests/core/config/` | New keys round-trip through layers; unknown alias warns; pyright + unit tests pass |
 | 2. Protocol | `peer/review` notification + `peer/configure` / `peer/read` / `peer/steer` RPCs validate on the wire and dispatch | `vibe/app_server/protocol.py`, `events.py`, `server.py` dispatch; contract tests | Malformed payloads rejected with typed errors; methods route to the module |
-| 3. Controller | Event tap → mirror → coalesced peer call → notification; budget; steer on threshold | `vibe/app_server/_peer_review.py`, `vibe/core/prompts/peer_review.md`; unit tests with `FakeBackend` | Fake-driven tests cover coalescing, budget, failure silence, steer trigger, interrupt cancel |
+| 3. Controller + tool loop | Event tap → mirror → coalesced peer call with read-only tool loop → notification; budget; steer on threshold; read-only allowlist enforced | `vibe/app_server/_peer_review.py`, `vibe/core/prompts/peer_review.md`, `PeerToolExecutor` port; unit tests with `FakeBackend` | Fake-driven tests cover coalescing, budget, failure silence, steer trigger, interrupt cancel, tool-round cap, and refusal of non-allowlisted tools |
 | 4. Session plumbing | `/peer` override lands in the session `OverridesLayer`; runtime derivation resolves the peer model; controller lifecycle follows backend activation | `vibe/app_server/_session_model.py` pattern, `_runtime.py`, `server.py` wiring | Session override survives reload, dies with the session; derivation test |
 | 5. TUI | Side panel renders `peer/review`, `/peer` command, key toggle, steer/dismiss actions | `vibe/cli-rust/src/commands/`, `vibe/cli-rust/src/ui/`; `client-e2e` scenario + golden | Golden shows the panel; `/peer` round-trips; `make test_rust` passes |
 | 6. Telemetry + docs | Events fire with approved properties; built-in `vibe` skill documents `/peer` and the config keys | `vibe/core/telemetry/`, `vibe/plugins/builtins/vibe/skills/vibe/SKILL.md` | `DEBUG_LEVEL=1` run shows events; skill updated |
@@ -314,6 +359,9 @@ repository changes.
 | Auto-steer injects only at/above threshold | Unit | same | Steer port called with marked message |
 | Steer after turn end marked not delivered | Unit | same | `delivered=false`; no exception |
 | Interrupt cancels in-flight peer call | Unit | same | Task cancelled; duck re-arms next turn |
+| Duck tool loop: results fed back, rounds capped | Unit | same | Final verdict produced; cap stops further rounds |
+| Read-only enforcement: write/bash/task never advertised; forged call refused | Unit | same | Executor rejects non-allowlisted tool names |
+| `allow_web_tools=false` removes web tools from the duck catalog | Unit | same + config test | Catalog contains only file tools |
 | `/peer` override session-scoped | Integration | `tests/app_server/` | Override gone on new session |
 | TUI panel + `/peer` end-to-end | End-to-end | `client-e2e` scenario + golden | Golden matches; commands round-trip |
 | Telemetry events fire with approved properties, no critique text | Manual | `DEBUG_LEVEL=1 uv run vibe` | Log lines show events; PII scan of properties |
