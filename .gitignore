@@ -214,6 +214,9 @@ result-*
 !.vibe/skills/release-cli/
 !.vibe/skills/release-cli/**
 
+# Brainstorming visual-companion mockups (local, session-scoped)
+.superpowers/
+
 
 # Tests run the agent in the playground, we don't need to keep the session files
 tests/playground/*
