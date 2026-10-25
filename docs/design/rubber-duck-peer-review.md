@@ -31,6 +31,11 @@ Accepted decisions from the design session (2026-10-24):
   or run shell commands, and it cannot spawn subagents — if a critique would
   benefit from a subagent, the duck recommends it and the main model or the
   user decides.
+- **Context:** independent. The duck has its own context — its own critic
+  system prompt, the user's original instructions, a bounded mirror of new
+  transcript material, and a concerns ledger (section 5). It never shares the
+  main model's context window or system prompt, and the main model's
+  compaction never affects it.
 
 ## 2. Problem
 
@@ -61,6 +66,9 @@ Current adjacent behavior, source-confirmed:
   speculation.
 - Cost is bounded: a configurable per-turn budget caps peer completions, and a
   per-review tool-round cap bounds tool use inside each completion.
+- The duck keeps an independent context and a bounded concerns ledger, so it
+  tracks open concerns across a turn without repeating itself and without
+  sharing the main model's context window.
 - The main turn is never blocked or failed by duck errors.
 
 ## 4. Non-Goals
@@ -96,6 +104,16 @@ Current adjacent behavior, source-confirmed:
   Web tools are gated by `peer_review.allow_web_tools` (default `true`) and
   their queries are shown in the panel. Write/edit/shell/subagent tools are
   never in the allowlist.
+- **Independent context:** the duck's own conversation context, constructed
+  per review — never the main model's context window, system prompt, or
+  compaction state. Built from: the critic system prompt, the user's original
+  instructions, the transcript material new since the last review (bounded
+  sliding window), and the concerns ledger.
+- **Concerns ledger:** a controller-maintained, count-bounded (default 10)
+  list of the duck's open critiques. It is the duck's memory across reviews:
+  the duck sees which concerns are still open, judges whether newer steps
+  addressed them, and closes them. Delivered steers are recorded here so the
+  duck knows what landed.
 - Constraints: the harness is an external dependency (ADR 0014 version skew);
   new agent behavior belongs in an app-server feature module (ADR 0018);
   server-owned behavior ships behind app-server methods/notifications, with the
@@ -154,10 +172,10 @@ the text is steered into the turn → `turn/completed` retires the duck.
 - **`/peer`** with no argument shows current state; `/peer <model>` enables
   with that model for this session; `/peer off` disables. Mirrors `/model`.
 - **Panel:** a toggleable right-hand split panel. Header shows the duck model
-  and its provider, plus status ("reviewing step N", "reading auth.py…",
-  "web search: …", "budget reached", "peer error: …"). While a review runs,
-  the panel shows the duck's read-only tool activity live, so its evidence
-  gathering is transparent. Each
+  and its provider, the count of open concerns, plus status ("reviewing step
+  N", "reading auth.py…", "web search: …", "budget reached", "peer error: …").
+  While a review runs, the panel shows the duck's read-only tool activity
+  live, so its evidence gathering is transparent. Each
   critique shows severity, target step, text, and actions: *steer main*
   (injects into the running turn; disabled once the turn ends or the review is
   delivered) and *dismiss*. When closed, the main chat reclaims the width.
@@ -236,14 +254,19 @@ Config (layered, ADR 0005):
 
 Duck completion contract: the duck model receives the read-only tool catalog
 (`read_file`, `grep`, and — when `allow_web_tools` — `web_search`,
-`web_fetch`) and the bounded transcript mirror. The controller runs a tool
-loop: each response's tool calls are executed through a `PeerToolExecutor`
-port against the session workspace, results are fed back, and the loop ends
-when the duck returns a final message or the per-review tool-round cap is hit.
-The final message is parsed as a strict JSON verdict
-(`{"severity": ..., "steerable": ..., "text": ...}`) with a tolerant fallback
-to plain text at `severity=info`. Temperature comes from the peer
-`ModelConfig`.
+`web_fetch`) and its **independent context**, constructed per review as: the
+critic system prompt (`vibe/core/prompts/peer_review.md`), the user's original
+instructions for the turn, the transcript material new since the last review
+(bounded sliding window, text-only), and the concerns ledger. The main
+model's system prompt, thinking blocks, and context window are never included.
+The controller runs a tool loop: each response's tool calls are executed
+through a `PeerToolExecutor` port against the session workspace, results are
+fed back, and the loop ends when the duck returns a final message or the
+per-review tool-round cap is hit. The final message is parsed as a strict
+JSON verdict (`{"severity": ..., "steerable": ..., "text": ...}`) with a
+tolerant fallback to plain text at `severity=info`. Temperature comes from
+the peer `ModelConfig`. Delivered steers are recorded in the ledger so the
+duck's next review knows what landed.
 
 Steer payload: a user-role message, text prefixed with a fixed marker
 (`[rubber duck] `) so the main model can attribute the source.
@@ -263,6 +286,11 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   turn.
 - Mirror bounds: the last N entries (default 40) plus the turn's original user
   message, token-capped; images stripped from the mirror (text-only review).
+- The duck's context is independent of the main model's: the main model's
+  compaction, context window size, and system prompt never affect it. The
+  duck's own context is bounded — the mirror is a sliding window and the
+  concerns ledger is count-capped (default 10); when full, the oldest closed
+  concerns drop first, then the oldest open ones with a "superseded" note.
 - Enabling mid-session starts the mirror fresh; the duck reviews from that
   point. Config reload re-resolves the peer model live; the enabled flag and
   budget survive.
@@ -284,6 +312,7 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | Duck tool call fails (missing file, network error) | Error text fed back to the duck as the tool result; review continues | Review record kept | Duck may retry within the round cap |
 | Duck emits a call to a non-allowlisted tool | Refused with an error result (the catalog only advertises allowlisted tools; the executor double-checks) | Review continues | None — defense in depth |
 | Tool-round cap hit mid-review | Verdict returned from gathered evidence | Review counted against budget | None |
+| Duck context overflow | Sliding window drops oldest entries; ledger drops closed concerns first | Bounded context preserved | Review proceeds with the reduced context |
 
 ### 7.7 Compatibility and Migration
 
@@ -362,6 +391,8 @@ repository changes.
 | Duck tool loop: results fed back, rounds capped | Unit | same | Final verdict produced; cap stops further rounds |
 | Read-only enforcement: write/bash/task never advertised; forged call refused | Unit | same | Executor rejects non-allowlisted tool names |
 | `allow_web_tools=false` removes web tools from the duck catalog | Unit | same + config test | Catalog contains only file tools |
+| Duck context is independent and bounded | Unit | same | Context contains critic prompt + new material + ledger; never the main system prompt; window slides under pressure |
+| Concerns ledger tracks and closes concerns across reviews | Unit | same | Open concerns persist; addressed concern closes; cap drops closed first |
 | `/peer` override session-scoped | Integration | `tests/app_server/` | Override gone on new session |
 | TUI panel + `/peer` end-to-end | End-to-end | `client-e2e` scenario + golden | Golden matches; commands round-trip |
 | Telemetry events fire with approved properties, no critique text | Manual | `DEBUG_LEVEL=1 uv run vibe` | Log lines show events; PII scan of properties |
