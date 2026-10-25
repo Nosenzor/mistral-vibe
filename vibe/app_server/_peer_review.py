@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any, Protocol
 
+from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import RequestFailure
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._patch import apply_json_patch
@@ -31,6 +32,8 @@ from vibe.app_server.models import (
 )
 from vibe.app_server.protocol import (
     ConfigEffectiveReadResponse,
+    ConfigWriteOpWire,
+    ConfigWriteParams,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
     PeerConfigureParams,
@@ -47,6 +50,7 @@ from vibe.app_server.protocol import (
     TurnSteerResponse,
 )
 from vibe.core.config import ModelConfig, PeerSeverity, UtilityFeature, VibeConfigSchema
+from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.models import ACTIVE_MODEL_SELECTOR
 from vibe.core.llm.backend.factory import create_backend
 from vibe.core.llm.types import BackendLike
@@ -75,6 +79,10 @@ class PeerReviewPorts(Protocol):
     async def effective_config(self, session_id: str) -> VibeConfigSchema: ...
 
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse: ...
+
+    async def set_peer_model(self, session_id: str, alias: str | None) -> None:
+        """Write the session-scoped override: an alias enables, None disables."""
+        ...
 
 
 type PeerReviewNotifyPort = Callable[[str, ProtocolModel], Awaitable[None]]
@@ -133,6 +141,31 @@ class SessionBackendPeerReviewPorts:
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse:
         return (await self._root.steer_turn(params)).response
 
+    async def set_peer_model(self, session_id: str, alias: str | None) -> None:
+        # The override layer outranks every durable layer, so an empty value
+        # is how a session says "off" even when a global config names a peer;
+        # the layer itself dies with the session.
+        result = await self._root.write_config(
+            ConfigWriteParams(
+                session_id=session_id,
+                ops=[
+                    ConfigWriteOpWire(
+                        op="set",
+                        path=UTILITY_MODEL_PEER_PATH,
+                        value=alias or "",
+                        target_layer=OverridesLayer.NAME,
+                    )
+                ],
+                reason="peer review model override",
+            )
+        )
+        if not result.response.applied:
+            detail = "; ".join(result.response.failures) or "the write was rejected"
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                f"Failed to set the peer model: {detail}",
+            )
+
 
 @dataclass(frozen=True, slots=True)
 class StoredPeerReview:
@@ -162,9 +195,10 @@ class _PeerPhase(StrEnum):
 
 @dataclass(slots=True)
 class _SessionPeerState:
-    # Duck configuration and delivered reviews (survive across turns).
-    model: str | None = None
-    explicitly_off: bool = False
+    # Delivered reviews and the session's auto-steer toggle (survive across
+    # turns). The duck's model is not cached here: it lives in the session's
+    # override layer and is re-resolved from the effective config per review,
+    # so a config reload re-resolves it live (design §7.5).
     auto_steer: bool | None = None
     reviews: dict[str, StoredPeerReview] = field(default_factory=dict)
     ledger: list[str] = field(default_factory=list)
@@ -243,8 +277,9 @@ class PeerReviewController:
     ) -> PeerConfigView:
         state = self._sessions.setdefault(params.session_id, _SessionPeerState())
         if params.model is None:
-            state.model = None
-            state.explicitly_off = True
+            # None disables the duck for the session: the override layer
+            # outranks any lower layer that names a peer model.
+            await ports.set_peer_model(params.session_id, None)
         else:
             alias = params.model.strip()
             if not alias:
@@ -261,8 +296,7 @@ class PeerReviewController:
                     ProtocolErrorCode.INVALID_PARAMS,
                     f"Unknown model alias for peer review: '{alias}'",
                 )
-            state.model = alias
-            state.explicitly_off = False
+            await ports.set_peer_model(params.session_id, alias)
         if params.auto_steer is not None:
             state.auto_steer = params.auto_steer
         return await self._view(params.session_id, state, ports)
@@ -430,7 +464,7 @@ class PeerReviewController:
         config = await ports.backend.effective_config(session_id)
         if state.budget_used >= config.peer_review.max_reviews_per_turn:
             return
-        model = self._resolve_model(state, config)
+        model = self._resolve_model(config)
         if model is None:
             return
         state.review_counter += 1
@@ -655,19 +689,13 @@ class PeerReviewController:
         return True
 
     @staticmethod
-    def _resolve_model(
-        state: _SessionPeerState, config: VibeConfigSchema
-    ) -> ModelConfig | None:
-        """The duck's model: the session override, else ``[utility_models] peer``."""
-        if state.explicitly_off:
-            return None
-        if state.model is not None:
-            if state.model == ACTIVE_MODEL_SELECTOR:
-                try:
-                    return config.get_active_model()
-                except ValueError:
-                    return None
-            return config.available_models().get(state.model)
+    def _resolve_model(config: VibeConfigSchema) -> ModelConfig | None:
+        """The duck's model, resolved from the session's effective config.
+
+        ``[utility_models] peer`` carries the session override when the user
+        ran ``/peer``; an empty or unknown alias means no duck (design §7.2:
+        off by default).
+        """
         return config.get_utility_model(UtilityFeature.PEER)
 
     async def _emit(self, params: PeerReviewParams) -> None:
@@ -701,14 +729,10 @@ class PeerReviewController:
         self, session_id: str, state: _SessionPeerState, ports: PeerReviewPorts
     ) -> PeerConfigView:
         config = await ports.effective_config(session_id)
-        config_alias = config.utility_models.alias_for(UtilityFeature.PEER)
-        enabled = state.model is not None or (
-            bool(config_alias) and not state.explicitly_off
-        )
-        model = state.model or (config_alias if enabled else None)
+        alias = config.utility_models.alias_for(UtilityFeature.PEER)
         return PeerConfigView(
-            enabled=enabled,
-            model=model or None,
+            enabled=bool(alias),
+            model=alias or None,
             auto_steer=_effective_auto_steer(state, config),
             max_reviews_per_turn=config.peer_review.max_reviews_per_turn,
             auto_steer_severity=config.peer_review.auto_steer_severity,

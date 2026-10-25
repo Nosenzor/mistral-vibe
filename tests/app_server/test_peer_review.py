@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 import json
 from pathlib import Path
+import time
 from typing import Any, Literal, cast
 
 from pydantic import ValidationError
@@ -12,6 +13,7 @@ import pytest
 from tests.conftest import build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
+from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import DispatchResult, RequestFailure
 from vibe.app_server._model import validate_wire
 from vibe.app_server._patch import make_json_patch
@@ -33,6 +35,7 @@ from vibe.app_server._session_backend_port import (
     SessionBackendEvent,
     SessionBackendHost,
     SessionBackendResult,
+    SessionEventSubscription,
 )
 from vibe.app_server.events import (
     ClientProjection,
@@ -54,6 +57,10 @@ from vibe.app_server.models import (
 from vibe.app_server.protocol import (
     SERVER_METHODS,
     ConfigEffectiveReadResponse,
+    ConfigWriteOpWire,
+    ConfigWriteParams,
+    ConfigWriteResponse,
+    EmptyResponse,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
     Notification,
@@ -65,6 +72,9 @@ from vibe.app_server.protocol import (
     PeerSteerParams,
     PeerSteerResponse,
     ProtocolErrorCode,
+    SessionDeleteParams,
+    SessionReadParams,
+    SessionReadResponse,
     TurnCompletedParams,
     TurnStartedParams,
     TurnSteerParams,
@@ -73,6 +83,7 @@ from vibe.app_server.protocol import (
 from vibe.app_server.server import AppServer
 from vibe.app_server.transport import memory_transport_pair
 from vibe.core.config import ModelConfig, PeerSeverity, VibeConfigSchema
+from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.tools.base import ToolError
 from vibe.core.types import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
 
@@ -92,6 +103,7 @@ class _FakePorts:
         self._config = config
         self.steered: list[TurnSteerParams] = []
         self.steer_error: RequestFailure | None = None
+        self.peer_model_writes: list[str | None] = []
 
     async def effective_config(self, session_id: str) -> VibeConfigSchema:
         return self._config
@@ -101,6 +113,12 @@ class _FakePorts:
             raise self.steer_error
         self.steered.append(params)
         return TurnSteerResponse()
+
+    async def set_peer_model(self, session_id: str, alias: str | None) -> None:
+        # Simulate the session override layer: the write is visible to the
+        # next effective-config read, and an empty value means off.
+        self.peer_model_writes.append(alias)
+        self._config.utility_models.peer = alias or ""
 
 
 class _FakeNotify:
@@ -235,6 +253,10 @@ async def test_configure_enables_with_a_known_alias() -> None:
 
     assert view.enabled is True
     assert view.model == "beta"
+    # The pick lands in the session override layer, not controller memory.
+    assert ports.peer_model_writes == ["beta"]
+    effective = await ports.effective_config("session-1")
+    assert effective.utility_models.peer == "beta"
 
 
 @pytest.mark.asyncio
@@ -248,6 +270,7 @@ async def test_configure_rejects_an_unknown_alias() -> None:
         )
 
     assert exc_info.value.code is ProtocolErrorCode.INVALID_PARAMS
+    assert ports.peer_model_writes == []
 
 
 @pytest.mark.asyncio
@@ -272,6 +295,10 @@ async def test_configure_off_overrides_the_config_default() -> None:
 
     assert view.enabled is False
     assert view.model is None
+    # Off is an explicit empty override, so it outranks the config default.
+    assert ports.peer_model_writes == [None]
+    effective = await ports.effective_config("session-1")
+    assert effective.utility_models.peer == ""
 
 
 @pytest.mark.asyncio
@@ -341,10 +368,17 @@ async def test_steer_reports_not_delivered_when_the_turn_ended() -> None:
     assert response == PeerSteerResponse(accepted=False, delivered=False)
 
 
+def _config_write_response() -> ConfigWriteResponse:
+    # The peer controller reads only `applied`/`failures`; the runtime snapshot
+    # payload is irrelevant to it, so the fake skips building one.
+    return ConfigWriteResponse.model_construct()
+
+
 class _FakeRootBackend:
     def __init__(self, config: VibeConfigSchema) -> None:
         self.session_id = "session-1"
         self._config = config
+        self.written_ops: list[ConfigWriteOpWire] = []
 
     async def dispatch_extension(
         self, method: str, raw_params: dict[str, Any]
@@ -359,12 +393,30 @@ class _FakeRootBackend:
     ) -> SessionBackendResult[TurnSteerResponse]:
         return SessionBackendResult(response=TurnSteerResponse())
 
+    async def write_config(
+        self, params: ConfigWriteParams
+    ) -> SessionBackendResult[ConfigWriteResponse]:
+        # Simulate the backend applying a config/write batch to the session
+        # override layer.
+        self.written_ops.extend(params.ops)
+        for op in params.ops:
+            assert op.path == UTILITY_MODEL_PEER_PATH
+            assert op.target_layer == OverridesLayer.NAME
+            self._config.utility_models.peer = str(op.value or "")
+        return SessionBackendResult(response=_config_write_response())
+
+
+class _FakeBackendHost:
+    async def shutdown(self) -> None: ...
+
 
 def _make_server() -> AppServer:
     _client_transport, server_transport = memory_transport_pair()
     return AppServer(
         server_transport,
-        session_backend_host_factory=lambda _: cast(SessionBackendHost, object()),
+        session_backend_host_factory=lambda _: cast(
+            SessionBackendHost, _FakeBackendHost()
+        ),
     )
 
 
@@ -396,6 +448,46 @@ async def test_peer_methods_route_to_the_controller() -> None:
 
 
 @pytest.mark.asyncio
+async def test_peer_configure_writes_the_session_overrides_layer() -> None:
+    server = _make_server()
+    backend = _FakeRootBackend(_config())
+    root = cast(SessionBackend, backend)
+
+    result = await server._dispatch_backend_operation(
+        root, "peer/configure", {"sessionId": "session-1", "model": "beta"}
+    )
+    assert result is not None
+    assert isinstance(result.response, PeerConfigView)
+    assert result.response.enabled is True
+
+    # /peer lands in the session-scoped overrides layer, not a durable file.
+    assert len(backend.written_ops) == 1
+    op = backend.written_ops[0]
+    assert op.op == "set"
+    assert op.path == UTILITY_MODEL_PEER_PATH
+    assert op.value == "beta"
+    assert op.target_layer == OverridesLayer.NAME
+
+    # /peer off writes an explicit empty override, outranking any default.
+    result = await server._dispatch_backend_operation(
+        root, "peer/configure", {"sessionId": "session-1"}
+    )
+    assert result is not None
+    assert isinstance(result.response, PeerConfigView)
+    assert result.response.enabled is False
+    assert backend.written_ops[-1].value == ""
+
+    # The override is session memory: a fresh backend has no peer model.
+    fresh_root = cast(SessionBackend, _FakeRootBackend(_config()))
+    result = await server._dispatch_backend_operation(
+        fresh_root, "peer/read", {"sessionId": "session-1"}
+    )
+    assert result is not None
+    assert isinstance(result.response, PeerConfigView)
+    assert result.response.enabled is False
+
+
+@pytest.mark.asyncio
 async def test_peer_methods_reject_malformed_payloads() -> None:
     server = _make_server()
     root = cast(SessionBackend, _FakeRootBackend(_config()))
@@ -404,6 +496,132 @@ async def test_peer_methods_reject_malformed_payloads() -> None:
         await server._dispatch_backend_operation(
             root, "peer/configure", {"sessionId": "session-1", "model": 42}
         )
+
+
+# --- Slice 4: session plumbing (override writes, controller lifecycle) ---
+
+
+class _FakeSessionBackend(_FakeRootBackend):
+    """A session backend double with a controllable event stream."""
+
+    def __init__(
+        self,
+        config: VibeConfigSchema,
+        *,
+        session_id: str = "session-1",
+        cwd: str | None = "/workspace",
+    ) -> None:
+        super().__init__(config)
+        self.session_id = session_id
+        self._cwd = cwd
+        self._events: asyncio.Queue[SessionBackendEvent | None] = asyncio.Queue()
+        self.shutdown_called = False
+
+    def _snapshot(self) -> SessionReadResponse:
+        return SessionReadResponse(
+            state=PublicSessionState(
+                event_id=0,
+                session=PublicSession(
+                    id=self.session_id,
+                    status=IdleSessionStatus(),
+                    created_at=1,
+                    updated_at=1,
+                    cwd=self._cwd,
+                ),
+            ),
+            last_event_id=0,
+        )
+
+    async def read(self, params: SessionReadParams) -> SessionReadResponse:
+        return self._snapshot()
+
+    async def subscribe(self, params: SessionReadParams) -> SessionEventSubscription:
+        return SessionEventSubscription(
+            snapshot=self._snapshot(), events=self._event_stream()
+        )
+
+    async def _event_stream(self) -> AsyncIterator[SessionBackendEvent]:
+        while True:
+            envelope = await self._events.get()
+            if envelope is None:
+                return
+            yield envelope
+
+    async def push(self, envelope: SessionBackendEvent) -> None:
+        await self._events.put(envelope)
+
+    async def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+async def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not met within timeout")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_peer_review_lifecycle_follows_backend_activation() -> None:
+    server = _make_server()
+    backend = _FakeSessionBackend(_config())
+
+    await server._activate_backend(cast(SessionBackend, backend), 200)
+
+    state = server._peer_review._sessions.get("session-1")
+    assert state is not None
+    assert state.ports is not None
+    assert isinstance(state.ports.tool_executor, WorkspacePeerToolExecutor)
+
+    # The server event fan-out taps the controller: turn/started arms the loop.
+    await backend.push(_turn_event("turn/started", _turn()))
+    await _wait_for(lambda: state.phase is peer_review_module._PeerPhase.ARMED)
+
+    # A backend switch detaches and forgets the old session's duck state.
+    replacement = _FakeSessionBackend(_config(), session_id="session-2")
+    await server._activate_backend(cast(SessionBackend, replacement), 200)
+
+    assert backend.shutdown_called is True
+    assert "session-1" not in server._peer_review._sessions
+    replacement_state = server._peer_review._sessions.get("session-2")
+    assert replacement_state is not None
+    assert replacement_state.ports is not None
+
+    await server.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_review_state_dies_with_server_close() -> None:
+    server = _make_server()
+    backend = cast(SessionBackend, _FakeSessionBackend(_config()))
+    await server._activate_backend(backend, 200)
+    assert "session-1" in server._peer_review._sessions
+
+    await server.close()
+
+    assert server._peer_review._sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_peer_review_state_dies_with_session_delete() -> None:
+    class _DeleteHost:
+        async def delete(self, params: SessionDeleteParams) -> EmptyResponse:
+            return EmptyResponse()
+
+    _client_transport, server_transport = memory_transport_pair()
+    server = AppServer(
+        server_transport,
+        session_backend_host_factory=lambda _: cast(SessionBackendHost, _DeleteHost()),
+    )
+    backend = cast(SessionBackend, _FakeSessionBackend(_config()))
+    await server._activate_backend(backend, 200)
+    assert "session-1" in server._peer_review._sessions
+
+    result = await server._delete_session({"sessionId": "session-1"})
+
+    assert result is not None
+    assert server._peer_review._sessions == {}
 
 
 # --- Slice 3: the review loop (event tap, mirror, coalesced peer call) ---
