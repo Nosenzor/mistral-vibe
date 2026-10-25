@@ -27,6 +27,7 @@ from vibe.app_server.protocol import (
     HistoryEntryUpdatedParams,
     MCPAuthRequiredParams,
     Notification,
+    PeerReviewParams,
     ServerErrorParams,
     ServerWarningParams,
     SessionCompactedParams,
@@ -249,6 +250,7 @@ def reconcile_snapshot(
 type _KnownEventParams = (
     HistoryEntryAddedParams
     | HistoryEntryUpdatedParams
+    | PeerReviewParams
     | SessionSnapshotParams
     | SessionCompactedParams
     | SessionContextClearedParams
@@ -443,6 +445,9 @@ class ClientProjection:
             case ChildSessionUpdatedParams():
                 self._replace_child_session(params.child_session)
                 event = ChildSessionUpdated(params.child_session)
+            case PeerReviewParams():
+                # Transient panel notification; carries no session state.
+                event = None
             case SessionCompactedParams() | SessionContextClearedParams():
                 raise AssertionError("Session handoffs are reduced before events")
         return event
@@ -661,6 +666,8 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
             params = validate_wire(StatsUpdatedParams, notification.params)
         case "session/childSessionUpdated":
             params = validate_wire(ChildSessionUpdatedParams, notification.params)
+        case "peer/review":
+            params = validate_wire(PeerReviewParams, notification.params)
         case _:
             raise UnknownNotificationError(
                 f"Unknown app-server notification: {notification.method}"

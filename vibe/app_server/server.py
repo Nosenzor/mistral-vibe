@@ -18,6 +18,10 @@ from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._identity import IdentityGateway
 from vibe.app_server._imports import ImportsService
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._peer_review import (
+    PeerReviewController,
+    SessionBackendPeerReviewPorts,
+)
 from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendCallbackSink,
@@ -89,6 +93,9 @@ from vibe.app_server.protocol import (
     ModelConfigWriteParams,
     Notification,
     PageRequest,
+    PeerConfigureParams,
+    PeerReadParams,
+    PeerSteerParams,
     ProtocolError,
     ProtocolErrorCode,
     ServerInfo,
@@ -189,6 +196,9 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/reload",
     "config/model/write",
     "config/write",
+    "peer/configure",
+    "peer/read",
+    "peer/steer",
     "session/agent/update",
     "session/compact",
     "session/context/inject",
@@ -280,6 +290,7 @@ class AppServer:
         self._connector_catalog_service = connector_catalog_service
         self._plugin_catalog_service = plugin_catalog_service
         self._imports_service = imports_service
+        self._peer_review = PeerReviewController()
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
             raise TypeError(
@@ -1270,7 +1281,31 @@ class AppServer:
                 return await self._dispatch_backend_config(root, method, raw_params)
             case "callback":
                 return await self._dispatch_backend_callback(root, method, raw_params)
+            case "peer":
+                return await self._dispatch_backend_peer(root, method, raw_params)
         return None
+
+    async def _dispatch_backend_peer(
+        self, root: SessionBackend, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        ports = SessionBackendPeerReviewPorts(root)
+        controller = self._peer_review
+        response: ProtocolModel
+        if method == "peer/configure":
+            response = await controller.configure(
+                validate_wire(PeerConfigureParams, raw_params), ports
+            )
+        elif method == "peer/read":
+            response = await controller.read(
+                validate_wire(PeerReadParams, raw_params), ports
+            )
+        elif method == "peer/steer":
+            response = await controller.steer(
+                validate_wire(PeerSteerParams, raw_params), ports
+            )
+        else:
+            return None
+        return DispatchResult(response)
 
     @staticmethod
     async def _dispatch_backend_session(
