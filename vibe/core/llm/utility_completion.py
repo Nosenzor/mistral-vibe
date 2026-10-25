@@ -213,6 +213,10 @@ def _call_type(
             return "title_generation"
         case UtilityFeature.SMART_APPROVE:
             return "smart_approve"
+        case UtilityFeature.PEER:
+            # The duck reviews through its own backend, not this helper; the
+            # generic secondary label keeps the feature mapping total.
+            return "secondary_call"
 
 
 def _discovered_fast_model(

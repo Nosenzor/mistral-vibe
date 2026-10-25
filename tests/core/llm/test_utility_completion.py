@@ -586,7 +586,11 @@ class TestEnsureUtilityModelsProbed:
 
         await ensure_utility_models_probed(
             _custom_front_config(
-                utility_models={"title": "active", "smart_approve": "active"}
+                utility_models={
+                    "title": "active",
+                    "smart_approve": "active",
+                    "peer": "active",
+                }
             )
         )
 
@@ -659,6 +663,7 @@ class TestFeatureLabelsTheCall:
         [
             (UtilityFeature.TITLE, "title_generation"),
             (UtilityFeature.SMART_APPROVE, "smart_approve"),
+            (UtilityFeature.PEER, "secondary_call"),
         ],
     )
     @pytest.mark.asyncio
