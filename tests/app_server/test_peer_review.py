@@ -104,6 +104,7 @@ class _FakePorts:
         self.steered: list[TurnSteerParams] = []
         self.steer_error: RequestFailure | None = None
         self.peer_model_writes: list[str | None] = []
+        self.events: list[tuple[str, dict[str, Any]]] = []
 
     async def effective_config(self, session_id: str) -> VibeConfigSchema:
         return self._config
@@ -119,6 +120,9 @@ class _FakePorts:
         # next effective-config read, and an empty value means off.
         self.peer_model_writes.append(alias)
         self._config.utility_models.peer = alias or ""
+
+    async def record_event(self, name: str, properties: dict[str, Any]) -> None:
+        self.events.append((name, properties))
 
 
 class _FakeNotify:
@@ -379,10 +383,14 @@ class _FakeRootBackend:
         self.session_id = "session-1"
         self._config = config
         self.written_ops: list[ConfigWriteOpWire] = []
+        self.telemetry: list[tuple[str, dict[str, Any]]] = []
 
     async def dispatch_extension(
         self, method: str, raw_params: dict[str, Any]
     ) -> DispatchResult:
+        if method == "telemetry/record":
+            self.telemetry.append((raw_params["name"], raw_params["properties"]))
+            return DispatchResult(EmptyResponse())
         assert method == "config/effective/read"
         return DispatchResult(
             ConfigEffectiveReadResponse(config=self._config.model_dump(mode="json"))
@@ -496,6 +504,59 @@ async def test_peer_methods_reject_malformed_payloads() -> None:
         await server._dispatch_backend_operation(
             root, "peer/configure", {"sessionId": "session-1", "model": 42}
         )
+
+
+@pytest.mark.asyncio
+async def test_peer_configure_records_telemetry_through_the_backend() -> None:
+    server = _make_server()
+    backend = _FakeRootBackend(_config())
+    root = cast(SessionBackend, backend)
+
+    await server._dispatch_backend_operation(
+        root, "peer/configure", {"sessionId": "session-1", "model": "beta"}
+    )
+
+    assert backend.telemetry == [
+        (
+            "vibe.peer_review.configured",
+            {
+                "enabled": True,
+                "auto_steer": False,
+                "auto_steer_severity": "critical",
+                "max_reviews_per_turn": 10,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_peer_steer_records_telemetry_through_the_backend() -> None:
+    server = _make_server()
+    backend = _FakeRootBackend(_config())
+    root = cast(SessionBackend, backend)
+    server._peer_review.store_review(
+        StoredPeerReview(
+            review_id="review-1",
+            turn_id="turn-1",
+            text="critique",
+            severity=PeerSeverity.WARNING,
+        ),
+        session_id="session-1",
+    )
+
+    result = await server._dispatch_backend_operation(
+        root, "peer/steer", {"sessionId": "session-1", "reviewId": "review-1"}
+    )
+
+    assert result is not None
+    assert isinstance(result.response, PeerSteerResponse)
+    assert result.response.delivered is True
+    assert backend.telemetry == [
+        (
+            "vibe.peer_review.steer_injected",
+            {"trigger": "manual", "severity": "warning", "delivered": True},
+        )
+    ]
 
 
 # --- Slice 4: session plumbing (override writes, controller lifecycle) ---
@@ -1532,3 +1593,217 @@ async def test_tap_ignores_events_for_unattached_sessions() -> None:
     await _drain(controller)
 
     assert backend.requests_messages == []
+
+
+# --- Slice 6: telemetry (design §7.8, ADR 0008) ---
+
+
+def _events_named(ports: _FakePorts, name: str) -> list[dict[str, Any]]:
+    return [properties for event, properties in ports.events if event == name]
+
+
+@pytest.mark.asyncio
+async def test_configure_records_the_configured_event() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    ports = _FakePorts(_config(peer_review={"auto_steer_severity": "warning"}))
+
+    await controller.configure(
+        PeerConfigureParams(session_id="session-1", model="beta"), ports
+    )
+    await controller.configure(
+        PeerConfigureParams(session_id="session-1", model=None), ports
+    )
+
+    assert _events_named(ports, "vibe.peer_review.configured") == [
+        {
+            "enabled": True,
+            "auto_steer": False,
+            "auto_steer_severity": "warning",
+            "max_reviews_per_turn": 10,
+        },
+        {
+            "enabled": False,
+            "auto_steer": False,
+            "auto_steer_severity": "warning",
+            "max_reviews_per_turn": 10,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_steer_records_steer_injected_manual() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    controller.store_review(
+        StoredPeerReview(
+            review_id="review-1",
+            turn_id="turn-1",
+            text="critique",
+            severity=PeerSeverity.WARNING,
+        ),
+        session_id="session-1",
+    )
+    ports = _FakePorts(_config())
+    response = await controller.steer(
+        PeerSteerParams(session_id="session-1", review_id="review-1"), ports
+    )
+
+    assert response.delivered is True
+    assert _events_named(ports, "vibe.peer_review.steer_injected") == [
+        {"trigger": "manual", "severity": "warning", "delivered": True}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_steer_records_a_failed_injection_as_not_delivered() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    controller.store_review(
+        StoredPeerReview(review_id="review-1", turn_id="turn-1", text="nit"),
+        session_id="session-1",
+    )
+    ports = _FakePorts(_config())
+    ports.steer_error = RequestFailure(
+        ProtocolErrorCode.INVALID_PARAMS, "turn already completed"
+    )
+    response = await controller.steer(
+        PeerSteerParams(session_id="session-1", review_id="review-1"), ports
+    )
+
+    assert response.delivered is False
+    assert _events_named(ports, "vibe.peer_review.steer_injected") == [
+        {"trigger": "manual", "severity": "info", "delivered": False}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_review_completed_records_the_verdict_event() -> None:
+    backend = FakeBackend(
+        chunks=[
+            _verdict_chunk(severity="warning", steerable=True, text="secret critique")
+        ]
+    )
+    controller, _, ports, _, _ = _make_loop(
+        _config(
+            utility_models={"peer": "beta"}, peer_review={"max_reviews_per_turn": 3}
+        ),
+        backend,
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one"))
+    )
+    await _drain(controller)
+
+    events = _events_named(ports, "vibe.peer_review.review_completed")
+    assert len(events) == 1
+    event = events[0]
+    assert event["severity"] == "warning"
+    assert event["steerable"] is True
+    assert event["delivered"] is False
+    assert event["budget_remaining"] == 2
+    assert isinstance(event["duration_ms"], int)
+    assert "secret critique" not in json.dumps(event)
+
+
+@pytest.mark.asyncio
+async def test_budget_exhaustion_records_once_per_turn() -> None:
+    backend = FakeBackend(chunks=[[_verdict_chunk()], [_verdict_chunk()]])
+    controller, _, ports, _, _ = _make_loop(
+        _config(
+            utility_models={"peer": "beta"}, peer_review={"max_reviews_per_turn": 1}
+        ),
+        backend,
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn("turn-1")))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one", turn_id="turn-1"))
+    )
+    await _drain(controller)
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-2", "two", turn_id="turn-1"))
+    )
+    await _drain(controller)
+    # A new turn resets the budget and the once-per-turn notice.
+    await controller.handle_backend_event(
+        _turn_event(
+            "turn/completed", _turn("turn-1", status=PublicTurnStatus.COMPLETED)
+        )
+    )
+    await controller.handle_backend_event(_turn_event("turn/started", _turn("turn-2")))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-3", "three", turn_id="turn-2"))
+    )
+    await _drain(controller)
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-4", "four", turn_id="turn-2"))
+    )
+    await _drain(controller)
+
+    assert _events_named(ports, "vibe.peer_review.budget_exhausted") == [
+        {"max_reviews_per_turn": 1, "reviews_run": 1},
+        {"max_reviews_per_turn": 1, "reviews_run": 1},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_review_error_records_the_error_class_only() -> None:
+    backend = FakeBackend(exception_to_raise=RuntimeError("provider boom"))
+    controller, _, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one"))
+    )
+    await _drain(controller)
+
+    events = _events_named(ports, "vibe.peer_review.error")
+    assert events == [{"stage": "run", "error_class": "RuntimeError"}]
+    assert "provider boom" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_records_a_cancelled_error_event() -> None:
+    gate = asyncio.Event()
+    backend = _GatedBackend([[_verdict_chunk()]], gate)
+    controller, _, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn("turn-1")))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one", turn_id="turn-1"))
+    )
+    await asyncio.sleep(0)  # let the review task start and park on the gate
+    await controller.handle_backend_event(
+        _turn_event(
+            "turn/completed", _turn("turn-1", status=PublicTurnStatus.INTERRUPTED)
+        )
+    )
+
+    assert _events_named(ports, "vibe.peer_review.error") == [
+        {"stage": "cancelled", "error_class": "CancelledError"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_steer_records_steer_injected_auto() -> None:
+    backend = FakeBackend(
+        chunks=[_verdict_chunk(severity="critical", steerable=True, text="stop that")]
+    )
+    controller, _, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}, peer_review={"auto_steer": True}),
+        backend,
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one"))
+    )
+    await _drain(controller)
+
+    assert _events_named(ports, "vibe.peer_review.steer_injected") == [
+        {"trigger": "auto", "severity": "critical", "delivered": True}
+    ]

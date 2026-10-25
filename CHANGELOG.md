@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Rubber-duck peer review: enable a second "duck" model with `/peer <model>` (or the `utility_models.peer` setting) and it watches the running turn, streaming critiques into a new side panel (`Ctrl+P`). While the panel is focused, `Enter` steers the selected critique into the running turn and `d` dismisses it; critiques at or above `auto_steer_severity` are steered automatically. Configure the duck under `[peer_review]` (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`).
+
 ## [3.0.2] - 2026-10-22
 
 ### Added

@@ -72,6 +72,14 @@ PEER_MIRROR_MAX_ENTRIES = 40
 PEER_LEDGER_MAX_CONCERNS = 10
 PEER_REVIEW_TIMEOUT_SECONDS = 30.0
 
+# Telemetry events (design §7.8, ADR 0008): closed vocabularies and counts
+# only — never critique text, exception messages, or model content.
+PEER_EVENT_CONFIGURED = "vibe.peer_review.configured"
+PEER_EVENT_REVIEW_COMPLETED = "vibe.peer_review.review_completed"
+PEER_EVENT_STEER_INJECTED = "vibe.peer_review.steer_injected"
+PEER_EVENT_BUDGET_EXHAUSTED = "vibe.peer_review.budget_exhausted"
+PEER_EVENT_ERROR = "vibe.peer_review.error"
+
 
 class PeerReviewPorts(Protocol):
     """Root-bound capabilities the controller needs; rebuilt per dispatch."""
@@ -82,6 +90,10 @@ class PeerReviewPorts(Protocol):
 
     async def set_peer_model(self, session_id: str, alias: str | None) -> None:
         """Write the session-scoped override: an alias enables, None disables."""
+        ...
+
+    async def record_event(self, name: str, properties: dict[str, Any]) -> None:
+        """Record one telemetry event through the session's telemetry client."""
         ...
 
 
@@ -140,6 +152,25 @@ class SessionBackendPeerReviewPorts:
 
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse:
         return (await self._root.steer_turn(params)).response
+
+    async def record_event(self, name: str, properties: dict[str, Any]) -> None:
+        # Telemetry rides the session's `telemetry/record` extension — the same
+        # bridge the client's features use — so the event carries the session's
+        # standardized metadata block. Best-effort: recording never fails the
+        # review loop.
+        if not isinstance(self._root, SessionBackendExtension):
+            return
+        try:
+            await self._root.dispatch_extension(
+                "telemetry/record",
+                {
+                    "sessionId": self._root.session_id,
+                    "name": name,
+                    "properties": properties,
+                },
+            )
+        except Exception:
+            logger.debug("Peer review telemetry event dropped", exc_info=True)
 
     async def set_peer_model(self, session_id: str, alias: str | None) -> None:
         # The override layer outranks every durable layer, so an empty value
@@ -207,6 +238,7 @@ class _SessionPeerState:
     phase: _PeerPhase = _PeerPhase.IDLE
     turn_id: str | None = None
     budget_used: int = 0
+    budget_noticed: bool = False
     mirror: list[PublicHistoryEntry] = field(default_factory=list)
     user_instructions: str = ""
     # The user's entry can arrive ahead of turn/started (snapshot order puts
@@ -299,7 +331,18 @@ class PeerReviewController:
             await ports.set_peer_model(params.session_id, alias)
         if params.auto_steer is not None:
             state.auto_steer = params.auto_steer
-        return await self._view(params.session_id, state, ports)
+        view = await self._view(params.session_id, state, ports)
+        await self._record(
+            ports,
+            PEER_EVENT_CONFIGURED,
+            {
+                "enabled": view.enabled,
+                "auto_steer": view.auto_steer,
+                "auto_steer_severity": view.auto_steer_severity.value,
+                "max_reviews_per_turn": view.max_reviews_per_turn,
+            },
+        )
+        return view
 
     async def read(
         self, params: PeerReadParams, ports: PeerReviewPorts
@@ -327,7 +370,21 @@ class PeerReviewController:
         try:
             await ports.steer(steer_params)
         except RequestFailure:
+            await self._record(
+                ports,
+                PEER_EVENT_STEER_INJECTED,
+                {
+                    "trigger": "manual",
+                    "severity": review.severity.value,
+                    "delivered": False,
+                },
+            )
             return PeerSteerResponse(accepted=False, delivered=False)
+        await self._record(
+            ports,
+            PEER_EVENT_STEER_INJECTED,
+            {"trigger": "manual", "severity": review.severity.value, "delivered": True},
+        )
         state.reviews[params.review_id] = StoredPeerReview(
             review_id=review.review_id,
             turn_id=review.turn_id,
@@ -380,6 +437,7 @@ class PeerReviewController:
         state.turn_id = turn.id
         state.phase = _PeerPhase.ARMED
         state.budget_used = 0
+        state.budget_noticed = False
         state.mirror = []
         state.mirror_dirty = False
         state.silenced = False
@@ -463,6 +521,17 @@ class PeerReviewController:
             return
         config = await ports.backend.effective_config(session_id)
         if state.budget_used >= config.peer_review.max_reviews_per_turn:
+            if not state.budget_noticed:
+                # Once per turn: the budget blocks every further review.
+                state.budget_noticed = True
+                await self._record(
+                    ports.backend,
+                    PEER_EVENT_BUDGET_EXHAUSTED,
+                    {
+                        "max_reviews_per_turn": config.peer_review.max_reviews_per_turn,
+                        "reviews_run": state.budget_used,
+                    },
+                )
             return
         model = self._resolve_model(config)
         if model is None:
@@ -489,6 +558,7 @@ class PeerReviewController:
         # scheduling but before the task started batch into this review, and
         # entries arriving while the backend call is in flight schedule the
         # trailing review (coalescing, design §7.5).
+        started = time.monotonic()
         mirror = state.mirror
         state.mirror = []
         state.mirror_dirty = False
@@ -515,6 +585,7 @@ class PeerReviewController:
                 await self._emit_failed(
                     session_id, review_id, turn_id, target_entry_id, "cancelled"
                 )
+            await self._record_error(state, "cancelled", "CancelledError")
             raise
         except TimeoutError:
             state.budget_used += 1
@@ -522,6 +593,7 @@ class PeerReviewController:
             await self._emit_failed(
                 session_id, review_id, turn_id, target_entry_id, "review timed out"
             )
+            await self._record_error(state, "timeout", "TimeoutError")
         except Exception as exc:
             logger.warning("Peer review failed", exc_info=exc)
             state.budget_used += 1
@@ -533,11 +605,27 @@ class PeerReviewController:
                 target_entry_id,
                 str(exc) or type(exc).__name__,
             )
+            await self._record_error(state, "run", type(exc).__name__)
         else:
             state.budget_used += 1
             delivered = await self._maybe_auto_steer(
                 session_id, state, config, verdict, turn_id
             )
+            if state.ports is not None:
+                await self._record(
+                    state.ports.backend,
+                    PEER_EVENT_REVIEW_COMPLETED,
+                    {
+                        "severity": verdict.severity.value,
+                        "steerable": verdict.steerable,
+                        "delivered": delivered,
+                        "budget_remaining": max(
+                            config.peer_review.max_reviews_per_turn - state.budget_used,
+                            0,
+                        ),
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                    },
+                )
             if verdict.severity.rank >= PeerSeverity.WARNING.rank:
                 prefix = "DELIVERED" if delivered else "OPEN"
                 _append_ledger_line(
@@ -685,7 +773,21 @@ class PeerReviewController:
             await ports.backend.steer(steer_params)
         except Exception:
             logger.warning("Peer review auto-steer failed", exc_info=True)
+            await self._record(
+                ports.backend,
+                PEER_EVENT_STEER_INJECTED,
+                {
+                    "trigger": "auto",
+                    "severity": verdict.severity.value,
+                    "delivered": False,
+                },
+            )
             return False
+        await self._record(
+            ports.backend,
+            PEER_EVENT_STEER_INJECTED,
+            {"trigger": "auto", "severity": verdict.severity.value, "delivered": True},
+        )
         return True
 
     @staticmethod
@@ -697,6 +799,28 @@ class PeerReviewController:
         off by default).
         """
         return config.get_utility_model(UtilityFeature.PEER)
+
+    async def _record(
+        self, ports: PeerReviewPorts, name: str, properties: dict[str, Any]
+    ) -> None:
+        """Fire-and-forget telemetry; recording never breaks the review loop."""
+        try:
+            await ports.record_event(name, properties)
+        except Exception:
+            logger.debug("Peer review telemetry event failed", exc_info=True)
+
+    async def _record_error(
+        self, state: _SessionPeerState, stage: str, error_class: str
+    ) -> None:
+        """One `vibe.peer_review.error`: the stage and the exception class only."""
+        ports = state.ports
+        if ports is None:
+            return
+        await self._record(
+            ports.backend,
+            PEER_EVENT_ERROR,
+            {"stage": stage, "error_class": error_class},
+        )
 
     async def _emit(self, params: PeerReviewParams) -> None:
         try:
