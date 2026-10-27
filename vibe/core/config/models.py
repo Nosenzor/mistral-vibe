@@ -130,6 +130,7 @@ class PeerReviewConfig(BaseSettings):
     auto_steer: bool = False
     auto_steer_severity: PeerSeverity = PeerSeverity.CRITICAL
     allow_web_tools: bool = True
+    timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
 
 class SessionLoggingConfig(BaseSettings):

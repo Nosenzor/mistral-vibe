@@ -685,7 +685,7 @@ steers the selected critique into the running turn and `d` dismisses it. The
 duck gets a read-only tool loop (file read/search, web fetch) and never edits
 files. `/peer off` disables it for the session. Configure the duck under
 `[peer_review]` in `config.toml` (`max_reviews_per_turn`, `max_tool_rounds`,
-`auto_steer`, `auto_steer_severity`, `allow_web_tools`), or set a default duck
+`auto_steer`, `auto_steer_severity`, `allow_web_tools`, `timeout_seconds`), or set a default duck
 model with `utility_models.peer`.
 
 ### Custom Slash Commands via Skills

@@ -1321,14 +1321,12 @@ async def test_malformed_verdict_falls_back_to_plain_text_at_info() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hung_peer_call_fails_at_the_review_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(peer_review_module, "PEER_REVIEW_TIMEOUT_SECONDS", 0.05)
+async def test_hung_peer_call_fails_at_the_review_timeout() -> None:
     gate = asyncio.Event()  # never set: the peer call hangs
     backend = _GatedBackend([_verdict_chunk()], gate)
     controller, notify, _, _, _ = _make_loop(
-        _config(utility_models={"peer": "beta"}), backend
+        _config(utility_models={"peer": "beta"}, peer_review={"timeout_seconds": 0.05}),
+        backend,
     )
 
     await controller.handle_backend_event(_turn_event("turn/started", _turn()))

@@ -303,7 +303,7 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 - Budget decrements per completed review attempt (success, failure, or
   timeout), per turn.
 - Each review attempt is bounded by a per-review timeout
-  (`PEER_REVIEW_TIMEOUT_SECONDS`, a controller constant, default 30s) so a
+  (`[peer_review] timeout_seconds`, default 60s) so a
   hung peer call cannot stall the duck: on timeout the controller emits a
   terminal `peer/review` (`failed`), counts the attempt against the budget,
   and silences the duck for the rest of the turn, like a provider error.
@@ -333,7 +333,7 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | Failure point | Caller result | Durable state | Recovery or retry |
 | :--- | :--- | :--- | :--- |
 | Peer provider error mid-review | `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms; no automatic retry within the turn |
-| Peer call hangs (no response, no error) | Review fails at `PEER_REVIEW_TIMEOUT_SECONDS`; terminal `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms |
+| Peer call hangs (no response, no error) | Review fails at `peer_review.timeout_seconds`; terminal `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms |
 | Peer model alias unknown | `peer/configure` fails with a typed validation error; config warns at load | Override not applied | User picks a valid alias |
 | Budget exhausted | Panel shows "budget reached" | Counter persists for the turn | Resets on next `turn/started` |
 | Steer rejected (turn ended) | Review stays displayed, `delivered=false` | Review record kept in panel | Manual re-steer disabled; user can paste the text |

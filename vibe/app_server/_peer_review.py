@@ -70,7 +70,6 @@ STEER_MESSAGE_PREFIX = "[rubber duck] "
 # duck's independent context bounded under pressure (design §7.5).
 PEER_MIRROR_MAX_ENTRIES = 40
 PEER_LEDGER_MAX_CONCERNS = 10
-PEER_REVIEW_TIMEOUT_SECONDS = 30.0
 
 # Telemetry events (design §7.8, ADR 0008): closed vocabularies and counts
 # only — never critique text, exception messages, or model content.
@@ -571,7 +570,7 @@ class PeerReviewController:
             )
         )
         try:
-            async with asyncio.timeout(PEER_REVIEW_TIMEOUT_SECONDS):
+            async with asyncio.timeout(config.peer_review.timeout_seconds):
                 verdict = await self._complete_review(state, config, model, mirror)
         except asyncio.CancelledError:
             # Interrupt or backend switch: the panel must not show a review
