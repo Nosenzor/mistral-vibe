@@ -66,6 +66,24 @@ async def test_read_file_caps_output_bytes(workspace: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_file_caps_the_read_and_marks_truncation(workspace: Path) -> None:
+    (workspace / "deep.txt").write_text(
+        "\n".join(f"line {index}" for index in range(200_000))
+    )
+    executor = WorkspacePeerToolExecutor(workspace)
+
+    result = json.loads(
+        await executor.execute(
+            "read_file", {"file_path": "deep.txt", "offset": 150_000, "limit": 5}
+        )
+    )
+
+    assert result["content"] == ""
+    assert result["numLines"] == 0
+    assert result["wasTruncated"] is True
+
+
+@pytest.mark.asyncio
 async def test_read_file_denies_paths_outside_the_workspace(workspace: Path) -> None:
     executor = WorkspacePeerToolExecutor(workspace)
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+import asyncio
+from collections.abc import AsyncIterator, Iterator
 import fnmatch
 import html
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -17,7 +19,7 @@ from vibe.core.tools.builtins.grep import GrepToolConfig
 from vibe.core.tools.builtins.read_file import DEFAULT_LINE_LIMIT, MAX_BYTES
 from vibe.core.tools.utils import DEFAULT_SENSITIVE_PATTERNS, matches_sensitive_pattern
 from vibe.utils.http import VibeAsyncHTTPClient, get_user_agent
-from vibe.utils.io import decode_safe, read_safe_async, split_lines_verbatim
+from vibe.utils.io import decode_safe, split_lines_verbatim
 
 READ_FILE_TOOL = "read_file"
 GREP_TOOL = "grep"
@@ -30,9 +32,15 @@ _FILE_TOOLS = frozenset({READ_FILE_TOOL, GREP_TOOL})
 
 GREP_MAX_OUTPUT_BYTES = 64_000
 GREP_MAX_FILE_BYTES = 1_000_000
+# read_file bounds the bytes pulled into memory the same way (the main tool's
+# max_read_bytes); the MAX_BYTES output cap still applies on top.
+READ_FILE_MAX_BYTES = 1_000_000
 WEB_FETCH_MAX_BYTES = 120_000
 WEB_FETCH_DEFAULT_TIMEOUT = 30.0
 WEB_FETCH_MAX_TIMEOUT = 120.0
+
+# Paths per offloaded walk batch: bounds memory while keeping the walk lazy.
+_WALK_BATCH = 256
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 _WHITESPACE = re.compile(r"\s+")
@@ -115,16 +123,19 @@ class WorkspacePeerToolExecutor:
         if limit is not None and (not isinstance(limit, int) or limit < 1):
             raise ToolError("read_file limit must be a positive integer")
         try:
-            result = await read_safe_async(resolved)
+            raw, read_truncated = await _read_bytes_capped(
+                resolved, READ_FILE_MAX_BYTES
+            )
         except OSError as exc:
             raise ToolError(f"Cannot read '{raw_path}': {exc}") from exc
-        lines = split_lines_verbatim(result.text)
+        lines = split_lines_verbatim(decode_safe(raw).text)
         start_line = offset or 1
         selected = lines[
             start_line - 1 : start_line - 1 + (limit or DEFAULT_LINE_LIMIT)
         ]
         content = "\n".join(selected)
-        was_truncated = len(lines) > start_line - 1 + len(selected)
+        past_window = len(lines) > start_line - 1 + len(selected)
+        was_truncated = read_truncated or past_window
         encoded = content.encode("utf-8", errors="replace")
         if len(encoded) > MAX_BYTES:
             content = encoded[:MAX_BYTES].decode("utf-8", errors="ignore")
@@ -161,11 +172,11 @@ class WorkspacePeerToolExecutor:
         matches: list[str] = []
         output_bytes = 0
         was_truncated = False
-        for path in self._walk(search_root):
+        async for path in self._walk_async(search_root):
             if matches_sensitive_pattern(str(path), self._sensitive_patterns):
                 continue
             try:
-                raw = await _read_bytes_capped(path)
+                raw, _ = await _read_bytes_capped(path, GREP_MAX_FILE_BYTES)
             except OSError:
                 continue
             text = decode_safe(raw).text
@@ -263,6 +274,19 @@ class WorkspacePeerToolExecutor:
                     continue
                 yield path
 
+    async def _walk_async(self, root: Path) -> AsyncIterator[Path]:
+        """``_walk`` off the event loop: each batch is collected in a worker
+        thread (the vibe-async rule), and the walk stays lazy so the output
+        caps still stop the search early.
+        """
+        walk = self._walk(root)
+        while True:
+            batch = await asyncio.to_thread(lambda: list(islice(walk, _WALK_BATCH)))
+            if not batch:
+                return
+            for path in batch:
+                yield path
+
 
 def _parse_http_url(url: str) -> SplitResult:
     parsed = urlsplit(url)
@@ -271,11 +295,19 @@ def _parse_http_url(url: str) -> SplitResult:
     return parsed
 
 
-async def _read_bytes_capped(path: Path) -> bytes:
-    raw = await anyio.Path(path).read_bytes()
-    if len(raw) > GREP_MAX_FILE_BYTES:
-        return raw[:GREP_MAX_FILE_BYTES]
-    return raw
+async def _read_bytes_capped(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+    """Stream at most ``max_bytes`` from ``path``; the flag reports more bytes.
+
+    Chunked reads keep a huge file from spiking memory on the event loop.
+    """
+    raw = bytearray()
+    async with await anyio.Path(path).open("rb") as handle:
+        while len(raw) <= max_bytes:
+            chunk = await handle.read(65536)
+            if not chunk:
+                break
+            raw.extend(chunk)
+    return bytes(raw[:max_bytes]), len(raw) > max_bytes
 
 
 def _matches_exclude(

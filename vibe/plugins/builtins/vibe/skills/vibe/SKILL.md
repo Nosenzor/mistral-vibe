@@ -326,7 +326,7 @@ max_reviews_per_turn = 10         # Review budget per turn; further reviews are 
 max_tool_rounds = 4               # Read-only tool rounds per review
 auto_steer = false                # Deliver critiques at or above auto_steer_severity automatically
 auto_steer_severity = "critical"  # Minimum severity auto-steer delivers: info | warning | critical
-allow_web_tools = true            # Let the duck call web_search/web_fetch while reviewing
+allow_web_tools = true            # Let the duck call web_fetch while reviewing (web_search is not available to the duck yet)
 ```
 
 ### Tool Configuration

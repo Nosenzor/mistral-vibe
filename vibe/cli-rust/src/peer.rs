@@ -241,6 +241,11 @@ impl PeerState {
         self.reviews.push_back(review);
         if self.reviews.len() > MAX_REVIEWS {
             self.reviews.pop_front();
+            if !follow {
+                // The eviction shifts every index down; keep the cursor on
+                // the same review.
+                self.selected = self.selected.saturating_sub(1);
+            }
         }
         if follow {
             self.selected = self.reviews.len() - 1;

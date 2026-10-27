@@ -117,6 +117,22 @@ fn upsert_drops_the_oldest_past_the_bound() {
 }
 
 #[test]
+fn an_evicted_oldest_review_keeps_an_off_tail_cursor_on_the_same_review() {
+    let mut state = PeerState::default();
+    for index in 0..MAX_REVIEWS {
+        state.upsert(review(&format!("r{index}")));
+    }
+    state.move_selection(false);
+    let parked = state.reviews[state.selected].review_id.clone();
+    state.upsert(review("overflow"));
+    assert_eq!(state.reviews.len(), MAX_REVIEWS);
+    assert_eq!(
+        state.reviews[state.selected].review_id, parked,
+        "the cursor stays on the same review across an eviction"
+    );
+}
+
+#[test]
 fn a_cursor_off_the_tail_stays_put() {
     let mut state = PeerState::default();
     state.upsert(review("r1"));

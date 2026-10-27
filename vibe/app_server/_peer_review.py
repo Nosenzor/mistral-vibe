@@ -246,7 +246,6 @@ class _SessionPeerState:
     pending_instructions: dict[str, str] = field(default_factory=dict)
     mirror_dirty: bool = False
     silenced: bool = False
-    last_entry_id: str | None = None
     review_counter: int = 0
     review_task: asyncio.Task[None] | None = None
 
@@ -441,7 +440,6 @@ class PeerReviewController:
         state.mirror = []
         state.mirror_dirty = False
         state.silenced = False
-        state.last_entry_id = None
         # The ledger is session-scoped: open concerns survive across turns.
         state.user_instructions = state.pending_instructions.pop(turn.id, "")
         state.pending_instructions.clear()
@@ -488,7 +486,6 @@ class PeerReviewController:
         state.mirror.append(entry)
         if len(state.mirror) > PEER_MIRROR_MAX_ENTRIES:
             del state.mirror[: len(state.mirror) - PEER_MIRROR_MAX_ENTRIES]
-        state.last_entry_id = entry.id
         state.mirror_dirty = True
 
     def _on_entry_updated(
@@ -505,7 +502,6 @@ class PeerReviewController:
                 state.mirror.pop(index)
                 return
             state.mirror[index] = updated
-            state.last_entry_id = updated.id
             state.mirror_dirty = True
             return
 
