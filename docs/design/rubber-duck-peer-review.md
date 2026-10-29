@@ -178,7 +178,9 @@ the text is steered into the turn → `turn/completed` retires the duck.
 - **Off by default.** No duck unless `[utility_models] peer` names a model or
   the user enables it.
 - **`/peer`** with no argument shows current state; `/peer <model>` enables
-  with that model for this session; `/peer off` disables. Mirrors `/model`.
+  with that model for this session; `/peer off` disables; `/peer steer on|off`
+  toggles auto-steer for this session (alone or after a model). Mirrors
+  `/model`.
 - **Panel:** a toggleable right-hand split panel. Header shows the duck model
   and its provider, the count of open concerns, plus status ("reviewing step
   N", "reading auth.py…", "web search: …", "budget reached", "peer error: …").
@@ -245,9 +247,11 @@ New wire shapes (all camelCase `ProtocolModel`s, `extra="forbid"`):
   (bool), `delivered` (bool), `text` (string), `error` (string, nullable).
   Emitted twice per review (running → complete), mirroring
   `history/entryAdded` + `history/entryUpdated`.
-- **`peer/configure`** — params `session_id`, `model` (string, nullable),
-  `auto_steer` (bool, nullable); response `PeerConfigView` (`enabled`,
-  `model`, `auto_steer`, `max_reviews_per_turn`, `auto_steer_severity`).
+- **`peer/configure`** — params `session_id`, `model` (string, nullable —
+  absent leaves the pick unchanged), `disable` (bool, default false — turns
+  the duck off), `auto_steer` (bool, nullable); response `PeerConfigView`
+  (`enabled`, `model`, `auto_steer`, `max_reviews_per_turn`,
+  `auto_steer_severity`).
 - **`peer/read`** — params `session_id`; response `PeerConfigView`.
 - **`peer/steer`** — params `session_id`, `review_id`; injects that review's
   text into the running turn. Response `PeerSteerResponse` (`accepted`,

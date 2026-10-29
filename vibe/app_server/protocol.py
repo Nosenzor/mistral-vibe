@@ -2629,8 +2629,10 @@ class PeerReviewParams(EventNotificationParams):
 
 class PeerConfigureParams(ProtocolModel):
     session_id: str
-    # None disables the duck for the session; a model alias enables it.
+    # A model alias enables the duck for the session; absent leaves the
+    # current pick unchanged. `disable` turns the duck off.
     model: str | None = None
+    disable: bool = False
     auto_steer: bool | None = None
 
 

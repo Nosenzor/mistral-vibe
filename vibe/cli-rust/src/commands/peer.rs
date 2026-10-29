@@ -8,8 +8,61 @@ use crate::app::App;
 use crate::peer::{PeerConfig, ReviewStatus};
 use crate::server::{method, Client};
 
+const USAGE: &str = "Usage: /peer [model|off] [steer on|off]";
+
+/// What `/peer` should do with its argument.
+#[derive(Debug, PartialEq)]
+pub enum PeerArgs {
+    Read,
+    Configure {
+        model: Option<String>,
+        disable: bool,
+        auto_steer: Option<bool>,
+    },
+}
+
+/// Parse the `/peer` argument: empty reads, `off` disables, a model alias
+/// enables, and `steer on|off` toggles auto-steer (alone or after a model).
+pub fn parse(arg: &str) -> Result<PeerArgs, String> {
+    // `off` is a reserved word, valid only as the whole argument.
+    if arg == "off" {
+        return Ok(PeerArgs::Configure {
+            model: None,
+            disable: true,
+            auto_steer: None,
+        });
+    }
+    let mut model: Option<String> = None;
+    let mut auto_steer: Option<bool> = None;
+    let mut tokens = arg.split_whitespace();
+    while let Some(token) = tokens.next() {
+        match token {
+            "steer" => match tokens.next() {
+                Some("on") if auto_steer.is_none() => auto_steer = Some(true),
+                Some("off") if auto_steer.is_none() => auto_steer = Some(false),
+                _ => return Err(USAGE.to_owned()),
+            },
+            "off" => return Err(USAGE.to_owned()),
+            other => {
+                if model.is_some() {
+                    return Err(USAGE.to_owned());
+                }
+                model = Some(other.to_owned());
+            }
+        }
+    }
+    if model.is_none() && auto_steer.is_none() {
+        return Ok(PeerArgs::Read);
+    }
+    Ok(PeerArgs::Configure {
+        model,
+        disable: false,
+        auto_steer,
+    })
+}
+
 /// `/peer`: no argument reads the state, `<model>` enables the duck for this
-/// session, `off` disables it.
+/// session, `off` disables it, `steer on|off` toggles auto-steer.
 pub fn run(app: &mut App, client: &Arc<Client>, value: &str) {
     let arg = value
         .split_once(char::is_whitespace)
@@ -21,19 +74,35 @@ pub fn run(app: &mut App, client: &Arc<Client>, value: &str) {
     };
     // Build the request before the spawn: `arg` borrows `value`, which the
     // spawned task must not capture.
-    let (request, params) = match arg {
-        "" => (
+    let (request, params) = match parse(arg) {
+        Ok(PeerArgs::Read) => (
             method::PEER_READ,
             serde_json::json!({ "sessionId": session_id }),
         ),
-        "off" => (
-            method::PEER_CONFIGURE,
-            serde_json::json!({ "sessionId": session_id, "model": null }),
-        ),
-        model => (
-            method::PEER_CONFIGURE,
-            serde_json::json!({ "sessionId": session_id, "model": model }),
-        ),
+        Ok(PeerArgs::Configure {
+            model,
+            disable,
+            auto_steer,
+        }) => {
+            let mut params = serde_json::json!({ "sessionId": session_id });
+            if let Some(model) = model {
+                params["model"] = serde_json::json!(model);
+            }
+            if disable {
+                params["disable"] = serde_json::json!(true);
+            }
+            if let Some(auto_steer) = auto_steer {
+                params["autoSteer"] = serde_json::json!(auto_steer);
+            }
+            (method::PEER_CONFIGURE, params)
+        }
+        Err(usage) => {
+            let _ = tx.try_send(CommandEvent::PeerConfig {
+                result: Err(usage),
+                announce: true,
+            });
+            return;
+        }
     };
     let client = client.clone();
     tokio::spawn(async move {

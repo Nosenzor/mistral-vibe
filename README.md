@@ -683,7 +683,9 @@ the running turn and streams critiques into a side panel (`Ctrl+P` toggles it).
 The panel lists each critique with its severity; while it is focused, `Enter`
 steers the selected critique into the running turn and `d` dismisses it. The
 duck gets a read-only tool loop (file read/search, web fetch) and never edits
-files. `/peer off` disables it for the session. Configure the duck under
+files. `/peer off` disables it for the session, and `/peer steer on|off`
+toggles auto-steer (critiques at or above `peer_review.auto_steer_severity`
+are injected into the running turn). Configure the duck under
 `[peer_review]` in `config.toml` (`max_reviews_per_turn`, `max_tool_rounds`,
 `auto_steer`, `auto_steer_severity`, `allow_web_tools`, `timeout_seconds`), or set a default duck
 model with `utility_models.peer`.

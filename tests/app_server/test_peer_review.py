@@ -178,6 +178,29 @@ def test_peer_review_params_use_camel_case_and_forbid_extras() -> None:
         validate_wire(PeerConfigureParams, {"session_id": "session-1"})
 
 
+def test_peer_configure_params_wire_shape() -> None:
+    params = validate_wire(
+        PeerConfigureParams,
+        {
+            "sessionId": "session-1",
+            "model": "beta",
+            "disable": False,
+            "autoSteer": True,
+        },
+    )
+    assert params.session_id == "session-1"
+    assert params.model == "beta"
+    assert params.disable is False
+    assert params.auto_steer is True
+    # Every field is optional apart from the session id.
+    minimal = validate_wire(PeerConfigureParams, {"sessionId": "session-1"})
+    assert minimal.model is None
+    assert minimal.disable is False
+    assert minimal.auto_steer is None
+    with pytest.raises(ValidationError):
+        validate_wire(PeerConfigureParams, {"sessionId": "session-1", "bogus": True})
+
+
 def _projection() -> ClientProjection:
     return ClientProjection(
         PublicSessionState(
@@ -294,7 +317,7 @@ async def test_configure_off_overrides_the_config_default() -> None:
     ports = _FakePorts(_config(utility_models={"peer": "beta"}))
 
     view = await controller.configure(
-        PeerConfigureParams(session_id="session-1", model=None), ports
+        PeerConfigureParams(session_id="session-1", disable=True), ports
     )
 
     assert view.enabled is False
@@ -308,7 +331,9 @@ async def test_configure_off_overrides_the_config_default() -> None:
 @pytest.mark.asyncio
 async def test_configure_auto_steer_override_wins_over_config() -> None:
     controller = PeerReviewController(notify=_FakeNotify())
-    ports = _FakePorts(_config(peer_review={"auto_steer": True}))
+    ports = _FakePorts(
+        _config(utility_models={"peer": "beta"}, peer_review={"auto_steer": True})
+    )
 
     view = await controller.read(PeerReadParams(session_id="session-1"), ports)
     assert view.auto_steer is True
@@ -317,6 +342,53 @@ async def test_configure_auto_steer_override_wins_over_config() -> None:
         PeerConfigureParams(session_id="session-1", auto_steer=False), ports
     )
     assert view.auto_steer is False
+
+
+@pytest.mark.asyncio
+async def test_configure_steer_only_leaves_the_model_untouched() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    ports = _FakePorts(_config(utility_models={"peer": "beta"}))
+
+    view = await controller.configure(
+        PeerConfigureParams(session_id="session-1", auto_steer=True), ports
+    )
+
+    # A steer-only configure must not disable (or re-pick) the duck.
+    assert ports.peer_model_writes == []
+    assert view.enabled is True
+    assert view.model == "beta"
+    assert view.auto_steer is True
+
+
+@pytest.mark.asyncio
+async def test_configure_model_and_steer_together() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    ports = _FakePorts(_config(peer_review={"auto_steer": False}))
+
+    view = await controller.configure(
+        PeerConfigureParams(session_id="session-1", model="beta", auto_steer=True),
+        ports,
+    )
+
+    assert ports.peer_model_writes == ["beta"]
+    assert view.enabled is True
+    assert view.model == "beta"
+    assert view.auto_steer is True
+
+
+@pytest.mark.asyncio
+async def test_configure_rejects_disable_combined_with_a_model() -> None:
+    controller = PeerReviewController(notify=_FakeNotify())
+    ports = _FakePorts(_config(utility_models={"peer": "beta"}))
+
+    with pytest.raises(RequestFailure) as exc_info:
+        await controller.configure(
+            PeerConfigureParams(session_id="session-1", model="beta", disable=True),
+            ports,
+        )
+
+    assert exc_info.value.code is ProtocolErrorCode.INVALID_PARAMS
+    assert ports.peer_model_writes == []
 
 
 @pytest.mark.asyncio
@@ -478,12 +550,21 @@ async def test_peer_configure_writes_the_session_overrides_layer() -> None:
 
     # /peer off writes an explicit empty override, outranking any default.
     result = await server._dispatch_backend_operation(
-        root, "peer/configure", {"sessionId": "session-1"}
+        root, "peer/configure", {"sessionId": "session-1", "disable": True}
     )
     assert result is not None
     assert isinstance(result.response, PeerConfigView)
     assert result.response.enabled is False
     assert backend.written_ops[-1].value == ""
+
+    # /peer steer on flips auto-steer without touching the model override.
+    result = await server._dispatch_backend_operation(
+        root, "peer/configure", {"sessionId": "session-1", "autoSteer": True}
+    )
+    assert result is not None
+    assert isinstance(result.response, PeerConfigView)
+    assert result.response.auto_steer is True
+    assert len(backend.written_ops) == 2
 
     # The override is session memory: a fresh backend has no peer model.
     fresh_root = cast(SessionBackend, _FakeRootBackend(_config()))
@@ -1609,7 +1690,7 @@ async def test_configure_records_the_configured_event() -> None:
         PeerConfigureParams(session_id="session-1", model="beta"), ports
     )
     await controller.configure(
-        PeerConfigureParams(session_id="session-1", model=None), ports
+        PeerConfigureParams(session_id="session-1", disable=True), ports
     )
 
     assert _events_named(ports, "vibe.peer_review.configured") == [

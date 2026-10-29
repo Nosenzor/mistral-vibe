@@ -345,3 +345,89 @@ fn config_text_reports_the_state() {
     assert!(text.contains("auto-steer off"));
     assert!(text.contains("10 reviews per turn"));
 }
+
+#[test]
+fn peer_command_parse_empty_reads() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(parse(""), Ok(PeerArgs::Read));
+    assert_eq!(parse("   "), Ok(PeerArgs::Read));
+}
+
+#[test]
+fn peer_command_parse_off_disables() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(
+        parse("off"),
+        Ok(PeerArgs::Configure {
+            model: None,
+            disable: true,
+            auto_steer: None,
+        })
+    );
+}
+
+#[test]
+fn peer_command_parse_model_enables() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(
+        parse("beta"),
+        Ok(PeerArgs::Configure {
+            model: Some("beta".to_owned()),
+            disable: false,
+            auto_steer: None,
+        })
+    );
+}
+
+#[test]
+fn peer_command_parse_steer_toggles_auto_steer() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(
+        parse("steer on"),
+        Ok(PeerArgs::Configure {
+            model: None,
+            disable: false,
+            auto_steer: Some(true),
+        })
+    );
+    assert_eq!(
+        parse("steer off"),
+        Ok(PeerArgs::Configure {
+            model: None,
+            disable: false,
+            auto_steer: Some(false),
+        })
+    );
+}
+
+#[test]
+fn peer_command_parse_model_and_steer_combine() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(
+        parse("beta steer on"),
+        Ok(PeerArgs::Configure {
+            model: Some("beta".to_owned()),
+            disable: false,
+            auto_steer: Some(true),
+        })
+    );
+    assert_eq!(
+        parse("steer off beta"),
+        Ok(PeerArgs::Configure {
+            model: Some("beta".to_owned()),
+            disable: false,
+            auto_steer: Some(false),
+        })
+    );
+}
+
+#[test]
+fn peer_command_parse_rejects_bad_usage() {
+    use vibe_rs::commands::peer::parse;
+    assert!(parse("steer").is_err());
+    assert!(parse("steer maybe").is_err());
+    assert!(parse("steer on off").is_err());
+    assert!(parse("beta gamma").is_err());
+    assert!(parse("beta off").is_err());
+    assert!(parse("off beta").is_err());
+}

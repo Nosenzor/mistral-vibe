@@ -306,11 +306,16 @@ class PeerReviewController:
         self, params: PeerConfigureParams, ports: PeerReviewPorts
     ) -> PeerConfigView:
         state = self._sessions.setdefault(params.session_id, _SessionPeerState())
-        if params.model is None:
-            # None disables the duck for the session: the override layer
-            # outranks any lower layer that names a peer model.
+        if params.disable:
+            if params.model is not None:
+                raise RequestFailure(
+                    ProtocolErrorCode.INVALID_PARAMS,
+                    "Cannot set a peer model and disable peer review at once",
+                )
+            # Off is an explicit empty override: the override layer outranks
+            # any lower layer that names a peer model.
             await ports.set_peer_model(params.session_id, None)
-        else:
+        elif params.model is not None:
             alias = params.model.strip()
             if not alias:
                 raise RequestFailure(

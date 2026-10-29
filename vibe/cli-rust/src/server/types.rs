@@ -135,7 +135,8 @@ pub mod method {
     pub const WORKSPACE_WORKTREE_REMOVE: &str = "workspace/git/worktrees/remove";
     /// The rubber-duck peer review state (`/peer` with no argument).
     pub const PEER_READ: &str = "peer/read";
-    /// Enable or disable the duck for the session (`/peer <model|off>`).
+    /// Enable or disable the duck, or toggle auto-steer, for the session
+    /// (`/peer <model|off> [steer on|off]`).
     pub const PEER_CONFIGURE: &str = "peer/configure";
     /// Steer one critique into the running turn (the panel's Enter action).
     pub const PEER_STEER: &str = "peer/steer";
