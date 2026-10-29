@@ -817,6 +817,32 @@ class _GatedBackend(FakeBackend):
         return await super().complete(**kwargs)
 
 
+class _HangOnceBackend(FakeBackend):
+    """Fake backend whose first completion hangs until the task is cancelled."""
+
+    def __init__(self, chunks: Any) -> None:
+        super().__init__(chunks)
+        self._hung = False
+
+    async def complete(self, **kwargs: Any) -> LLMChunk:
+        if not self._hung:
+            self._hung = True
+            await asyncio.Event().wait()
+        return await super().complete(**kwargs)
+
+
+class _SlowBackend(FakeBackend):
+    """Fake backend whose every completion takes `delay` seconds."""
+
+    def __init__(self, chunks: Any, delay: float) -> None:
+        super().__init__(chunks)
+        self._delay = delay
+
+    async def complete(self, **kwargs: Any) -> LLMChunk:
+        await asyncio.sleep(self._delay)
+        return await super().complete(**kwargs)
+
+
 def _make_loop(
     config: VibeConfigSchema,
     backend: FakeBackend,
@@ -1424,8 +1450,121 @@ async def test_hung_peer_call_fails_at_the_review_timeout() -> None:
     assert len(failed) == 1
     assert failed[0].error == "review timed out"
     state = controller._sessions["session-1"]
-    assert state.silenced is True
+    # A timeout cools the duck down instead of silencing it for the turn.
+    assert state.silenced is False
+    assert state.cooldown_until is not None
     assert state.budget_used == 1  # the attempt counts against the budget
+
+
+@pytest.mark.asyncio
+async def test_duck_recovers_on_the_next_turn_after_a_timeout() -> None:
+    backend = _HangOnceBackend([_verdict_chunk()])
+    controller, notify, _, _, factory = _make_loop(
+        _config(utility_models={"peer": "beta"}, peer_review={"timeout_seconds": 0.05}),
+        backend,
+    )
+
+    # Turn 1: the first review hangs and times out.
+    await controller.handle_backend_event(_turn_event("turn/started", _turn("turn-1")))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one", turn_id="turn-1"))
+    )
+    await _drain(controller)
+
+    failed = [
+        params
+        for _, params in notify.notifications
+        if params.status is PeerReviewStatus.FAILED
+    ]
+    assert len(failed) == 1
+    assert failed[0].error == "review timed out"
+
+    # Turn 2: the duck must review the new turn's material.
+    await controller.handle_backend_event(
+        _turn_event("turn/completed", _turn("turn-1", PublicTurnStatus.COMPLETED))
+    )
+    await controller.handle_backend_event(_turn_event("turn/started", _turn("turn-2")))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-2", "two", turn_id="turn-2"))
+    )
+    await _drain(controller)
+
+    assert factory.calls == 2
+    completes = _complete_notifications(notify)
+    assert len(completes) == 1
+    assert completes[0].text == "No concerns."
+
+
+@pytest.mark.asyncio
+async def test_duck_retries_within_the_turn_once_the_cooldown_elapses() -> None:
+    backend = _HangOnceBackend([_verdict_chunk()])
+    controller, notify, _, _, factory = _make_loop(
+        _config(utility_models={"peer": "beta"}, peer_review={"timeout_seconds": 0.05}),
+        backend,
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one"))
+    )
+    await _drain(controller)
+    state = controller._sessions["session-1"]
+    assert state.cooldown_until is not None
+    assert factory.calls == 1
+
+    # Still cooling down: new material does not trigger an immediate retry.
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-2", "two"))
+    )
+    await _drain(controller)
+    assert factory.calls == 1
+
+    # The cooldown elapses: the material accumulated meanwhile is reviewed.
+    state.cooldown_until -= 1.0
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-3", "three"))
+    )
+    await _drain(controller)
+
+    assert factory.calls == 2
+    # The hung first call never reached the backend's request log, so the
+    # retried review is the first recorded request.
+    retried_content = _user_content(backend, request_index=0)
+    assert "two" in retried_content
+    assert "three" in retried_content
+    completes = _complete_notifications(notify)
+    assert len(completes) == 1
+
+
+@pytest.mark.asyncio
+async def test_review_timeout_bounds_each_completion_not_the_whole_review() -> None:
+    # Two tool rounds plus the verdict at 150ms per completion: the review
+    # takes ~450ms in total, past the 300ms timeout, but every single
+    # completion is within it. The timeout bounds a hung call, not the sum of
+    # a healthy review's rounds.
+    backend = _SlowBackend(
+        [
+            [_tool_call_chunk("read_file", {"filePath": "a.py"})],
+            [_tool_call_chunk("grep", {"pattern": "x"})],
+            [_verdict_chunk()],
+        ],
+        delay=0.15,
+    )
+    controller, notify, _, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}, peer_review={"timeout_seconds": 0.3}),
+        backend,
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_message_entry("entry-1", "one"))
+    )
+    await _drain(controller)
+
+    assert len(backend.requests_messages) == 3
+    completes = _complete_notifications(notify)
+    assert len(completes) == 1
+    assert completes[0].text == "No concerns."
 
 
 @pytest.mark.asyncio

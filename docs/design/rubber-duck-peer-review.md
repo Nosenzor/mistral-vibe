@@ -197,9 +197,13 @@ the text is steered into the turn → `turn/completed` retires the duck.
   only — the manual *steer main* action is always offered while the turn
   runs, regardless of `steerable`.
 - **Degraded states:** peer provider errors mark the review failed and silence
-  the duck for the rest of the turn; the main turn is unaffected. Budget
-  exhaustion silences reviews but keeps the panel. A steer that arrives after
-  the turn ended leaves the critique displayed and marked "not delivered".
+  the duck for the rest of the turn; a timed-out review only cools the duck
+  down for one `timeout_seconds` period, after which it retries within the
+  turn (bounded by the budget) — timeouts are often transient (cold model,
+  slow first call), errors usually are not. The main turn is unaffected in
+  both cases. Budget exhaustion silences reviews but keeps the panel. A steer
+  that arrives after the turn ended leaves the critique displayed and marked
+  "not delivered".
 - **Cancellation:** interrupting the turn cancels the in-flight peer call.
 
 ### 7.3 Architecture and Ownership
@@ -306,11 +310,14 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   verdict from whatever evidence it gathered.
 - Budget decrements per completed review attempt (success, failure, or
   timeout), per turn.
-- Each review attempt is bounded by a per-review timeout
-  (`[peer_review] timeout_seconds`, default 60s) so a
-  hung peer call cannot stall the duck: on timeout the controller emits a
+- Each duck completion is bounded by a per-call timeout
+  (`[peer_review] timeout_seconds`, default 60s) so a hung peer call cannot
+  stall the duck, while a healthy review that spans several tool rounds is
+  not killed by the sum of its rounds: on timeout the controller emits a
   terminal `peer/review` (`failed`), counts the attempt against the budget,
-  and silences the duck for the rest of the turn, like a provider error.
+  and cools the duck down for one `timeout_seconds` period — once the deadline
+  passes, new transcript material triggers another attempt within the turn.
+  A provider error instead silences the duck for the rest of the turn.
   Cancellation (interrupt, backend switch) likewise emits a terminal `failed`
   notification so the panel never shows a review stuck at `running`.
 - Mirror bounds: the last N entries (`PEER_MIRROR_MAX_ENTRIES = 40`, a
@@ -337,7 +344,7 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | Failure point | Caller result | Durable state | Recovery or retry |
 | :--- | :--- | :--- | :--- |
 | Peer provider error mid-review | `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms; no automatic retry within the turn |
-| Peer call hangs (no response, no error) | Review fails at `peer_review.timeout_seconds`; terminal `peer/review` status `failed` | Review counted against budget; duck silenced until next turn | Next turn re-arms |
+| Peer call hangs (no response, no error) | One completion fails at `peer_review.timeout_seconds`; terminal `peer/review` status `failed` | Review counted against budget; duck cools down for one `timeout_seconds` period | Retries within the turn once the cooldown elapses (bounded by the budget); next turn re-arms regardless |
 | Peer model alias unknown | `peer/configure` fails with a typed validation error; config warns at load | Override not applied | User picks a valid alias |
 | Budget exhausted | Panel shows "budget reached" | Counter persists for the turn | Resets on next `turn/started` |
 | Steer rejected (turn ended) | Review stays displayed, `delivered=false` | Review record kept in panel | Manual re-steer disabled; user can paste the text |
@@ -397,7 +404,7 @@ Steer payload: a user-role message, text prefixed with a fixed marker
 | :--- | :--- | :--- | :--- |
 | 1. Config | `[utility_models] peer` + `[peer_review]` group (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`) load, merge, validate, and resolve via `get_utility_model(PEER)` | `vibe/core/config/models.py`, `vibe_schema.py`, `_defaults.py`; tests under `tests/core/config/` | New keys round-trip through layers; unknown alias warns; pyright + unit tests pass |
 | 2. Protocol | `peer/review` notification + `peer/configure` / `peer/read` / `peer/steer` RPCs validate on the wire and dispatch | `vibe/app_server/protocol.py`, `events.py`, `server.py` dispatch; contract tests | Malformed payloads rejected with typed errors; methods route to the module |
-| 3. Controller + tool loop | Event tap → mirror → coalesced peer call with read-only tool loop → notification; budget; steer on threshold; read-only allowlist enforced | `vibe/app_server/_peer_review.py`, `vibe/core/prompts/peer_review.md`, `PeerToolExecutor` port; unit tests with `FakeBackend` | Fake-driven tests cover coalescing, budget, failure silence, steer trigger, interrupt cancel, tool-round cap, and refusal of non-allowlisted tools |
+| 3. Controller + tool loop | Event tap → mirror → coalesced peer call with read-only tool loop → notification; budget; steer on threshold; read-only allowlist enforced | `vibe/app_server/_peer_review.py`, `vibe/core/prompts/peer_review.md`, `PeerToolExecutor` port; unit tests with `FakeBackend` | Fake-driven tests cover coalescing, budget, failure silence and timeout cooldown, per-call timeout vs multi-round reviews, steer trigger, interrupt cancel, tool-round cap, and refusal of non-allowlisted tools |
 | 4. Session plumbing | `/peer` override lands in the session `OverridesLayer`; runtime derivation resolves the peer model; controller lifecycle follows backend activation | `vibe/app_server/_session_model.py` pattern, `_runtime.py`, `server.py` wiring | Session override survives reload, dies with the session; derivation test |
 | 5. TUI | Side panel renders `peer/review`, `/peer` command, key toggle, steer/dismiss actions | `vibe/cli-rust/src/commands/`, `vibe/cli-rust/src/ui/`; `client-e2e` scenario + golden | Golden shows the panel; `/peer` round-trips; `make test_rust` passes |
 | 6. Telemetry + docs | Events fire with approved properties; built-in `vibe` skill documents `/peer` and the config keys | `vibe/core/telemetry/`, `vibe/plugins/builtins/vibe/skills/vibe/SKILL.md` | `DEBUG_LEVEL=1` run shows events; skill updated |
@@ -427,7 +434,8 @@ repository changes.
 | Mirror + coalescing: burst of entries yields one review | Unit | `tests/app_server/test_peer_review.py` with `FakeBackend` | One peer call per burst; mirror bounded |
 | Budget: N+1-th review is skipped | Unit | same | `budget_exhausted` telemetry; panel note |
 | Peer error silences duck for the turn, main turn unaffected | Unit / Integration | same + server dispatch test | `peer/review` failed; turn completes normally |
-| Hung peer call fails at the review timeout | Unit | same | Terminal `failed` emitted; attempt counted against budget |
+| Hung peer call fails at the per-call timeout | Unit | same | Terminal `failed` emitted; attempt counted against budget; duck retries after one timeout period |
+| Healthy multi-round review outlasts the timeout budget | Unit | same | Review completes: the timeout bounds each completion, not the review |
 | Auto-steer injects only at/above threshold | Unit | same | Steer port called with marked message |
 | Steer after turn end marked not delivered | Unit | same | `delivered=false`; no exception |
 | Interrupt cancels in-flight peer call | Unit | same | Task cancelled; duck re-arms next turn |

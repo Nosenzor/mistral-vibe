@@ -244,7 +244,11 @@ class _SessionPeerState:
     # entries before turns), so stash it per turn and pick it up on start.
     pending_instructions: dict[str, str] = field(default_factory=dict)
     mirror_dirty: bool = False
+    # A provider error silences the duck for the rest of the turn; a timed-out
+    # review only cools it down until this monotonic deadline, so the duck
+    # recovers within the turn once the deadline passes.
     silenced: bool = False
+    cooldown_until: float | None = None
     review_counter: int = 0
     review_task: asyncio.Task[None] | None = None
 
@@ -444,6 +448,7 @@ class PeerReviewController:
         state.mirror = []
         state.mirror_dirty = False
         state.silenced = False
+        state.cooldown_until = None
         # The ledger is session-scoped: open concerns survive across turns.
         state.user_instructions = state.pending_instructions.pop(turn.id, "")
         state.pending_instructions.clear()
@@ -520,6 +525,10 @@ class PeerReviewController:
         if ports is None:
             return
         config = await ports.backend.effective_config(session_id)
+        if state.cooldown_until is not None and time.monotonic() < state.cooldown_until:
+            # A timed-out review cools the duck down for one timeout period;
+            # the accumulated mirror is reviewed once the deadline passes.
+            return
         if state.budget_used >= config.peer_review.max_reviews_per_turn:
             if not state.budget_noticed:
                 # Once per turn: the budget blocks every further review.
@@ -575,8 +584,7 @@ class PeerReviewController:
             )
         )
         try:
-            async with asyncio.timeout(config.peer_review.timeout_seconds):
-                verdict = await self._complete_review(state, config, model, mirror)
+            verdict = await self._complete_review(state, config, model, mirror)
         except asyncio.CancelledError:
             # Interrupt or backend switch: the panel must not show a review
             # stuck at running. The notification must not mask the
@@ -588,8 +596,12 @@ class PeerReviewController:
             await self._record_error(state, "cancelled", "CancelledError")
             raise
         except TimeoutError:
+            # One completion hung past the per-call timeout. Unlike a provider
+            # error this can be transient (cold model, slow first call), so
+            # the duck cools down for one timeout period and may retry within
+            # the turn instead of staying silent until the next one.
             state.budget_used += 1
-            state.silenced = True
+            state.cooldown_until = time.monotonic() + config.peer_review.timeout_seconds
             await self._emit_failed(
                 session_id, review_id, turn_id, target_entry_id, "review timed out"
             )
@@ -690,15 +702,19 @@ class PeerReviewController:
         async with backend:
             while True:
                 offering_tools = rounds_left > 0 and bool(catalog)
-                chunk = await backend.complete(
-                    model=model,
-                    messages=messages,
-                    temperature=model.temperature,
-                    tools=catalog if offering_tools else None,
-                    tool_choice="auto" if offering_tools else None,
-                    max_tokens=None,
-                    extra_headers={"user-agent": get_user_agent(model.provider)},
-                )
+                # The timeout bounds one completion, not the whole review: a
+                # hung call fails after `timeout_seconds`, while a healthy
+                # multi-round review may span several timeout periods.
+                async with asyncio.timeout(config.peer_review.timeout_seconds):
+                    chunk = await backend.complete(
+                        model=model,
+                        messages=messages,
+                        temperature=model.temperature,
+                        tools=catalog if offering_tools else None,
+                        tool_choice="auto" if offering_tools else None,
+                        max_tokens=None,
+                        extra_headers={"user-agent": get_user_agent(model.provider)},
+                    )
                 message = chunk.message
                 tool_calls = message.tool_calls or []
                 if not tool_calls or not offering_tools:

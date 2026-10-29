@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Rubber-duck peer review: enable a second "duck" model with `/peer <model>` (or the `utility_models.peer` setting) and it watches the running turn, streaming critiques into a new side panel (`Ctrl+P`). While the panel is focused, `Enter` steers the selected critique into the running turn and `d` dismisses it; critiques at or above `auto_steer_severity` are steered automatically. `/peer steer on|off` toggles auto-steer for the session and `/peer off` disables the duck. Configure the duck under `[peer_review]` (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`, `timeout_seconds`).
+- Rubber-duck peer review: enable a second "duck" model with `/peer <model>` (or the `utility_models.peer` setting) and it watches the running turn, streaming critiques into a new side panel (`Ctrl+P`). While the panel is focused, `Enter` steers the selected critique into the running turn and `d` dismisses it; critiques at or above `auto_steer_severity` are steered automatically. `/peer steer on|off` toggles auto-steer for the session and `/peer off` disables the duck. Configure the duck under `[peer_review]` (`max_reviews_per_turn`, `max_tool_rounds`, `auto_steer`, `auto_steer_severity`, `allow_web_tools`, `timeout_seconds`). `timeout_seconds` bounds each duck call, so a review that spans several tool rounds is not killed by the sum of its rounds; a timed-out review pauses the duck for one timeout period and then retries within the turn, while a provider error silences the duck for the rest of the turn.
 
 ## [3.0.2] - 2026-10-22
 

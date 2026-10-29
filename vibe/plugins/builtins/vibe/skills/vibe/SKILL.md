@@ -327,7 +327,7 @@ max_tool_rounds = 4               # Read-only tool rounds per review
 auto_steer = false                # Deliver critiques at or above auto_steer_severity automatically
 auto_steer_severity = "critical"  # Minimum severity auto-steer delivers: info | warning | critical
 allow_web_tools = true            # Let the duck call web_fetch while reviewing (web_search is not available to the duck yet)
-timeout_seconds = 60              # Per-review timeout; a timed-out review silences the duck for the turn
+timeout_seconds = 60              # Per-call timeout; a timed-out review pauses the duck for one timeout period, then it retries within the turn
 ```
 
 ### Tool Configuration
