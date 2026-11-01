@@ -14,7 +14,10 @@ pub enum CommandEvent {
     Teleport(Box<crate::teleport::Reply>),
     Plugins(Box<crate::plugins::Event>),
     Leanstall(Box<super::leanstall::Event>),
+    /// A content command's markdown body.
     Result(String),
+    /// An action outcome, mounted as a `✓` row.
+    Status(String),
     /// The `/status` text, rendered with its exact counts muted.
     AgentStatistics(String),
     Renamed(String),
@@ -38,8 +41,14 @@ pub enum CommandEvent {
         reads: Option<AccountReads>,
         greeting: Option<String>,
     },
-    /// A `/whoami` fetch that missed the cache.
-    Whoami(Option<AccountReads>),
+    /// The post-ready `artifacts/list` answer, for the bottom-bar PR link.
+    ArtifactsRead(Vec<crate::server::PublicSessionArtifact>),
+    /// The `/whoami` reads: identity and account (cached or fetched) and the
+    /// `providerAuth/read` view, each `None` when its read failed.
+    Whoami {
+        reads: Option<AccountReads>,
+        auth: Option<Value>,
+    },
     /// A manual shell request settled; notifications already carried its output.
     ShellCompleted {
         operation_id: String,
@@ -93,6 +102,6 @@ pub fn reload_result(value: Value) -> CommandEvent {
     match value.get("runtime") {
         // Keep the `{runtime: ...}` wrapper `apply_runtime_value` reads.
         Some(_) => CommandEvent::Runtime(value, text),
-        None => CommandEvent::Result(text),
+        None => CommandEvent::Status(text),
     }
 }

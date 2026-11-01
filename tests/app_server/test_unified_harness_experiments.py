@@ -12,6 +12,7 @@ import pytest
 import tomli_w
 
 from tests.stubs.experiment_responses import routing_eval_response
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server.models import AccountPlanKind
 from vibe.app_server.protocol import ClientInfo, SessionOptions
 from vibe.core.experiments.client import RemoteEvalClient
@@ -108,11 +109,15 @@ class _RecordingServices:
 
 # The shared test config keeps telemetry and the A/B opt-in off so a leaked key
 # can never reach GrowthBook; a test about experiments opts itself back in.
-def _enable_experiments(config_dir: Path, *, enable: bool = True) -> None:
+def _enable_experiments(
+    config_dir: Path, *, enable: bool = True, system_prompt_id: str | None = None
+) -> None:
     config_file = config_dir / "config.toml"
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     config["enable_telemetry"] = True
     config["experiments"] = {"enable": enable}
+    if system_prompt_id is not None:
+        config["system_prompt_id"] = system_prompt_id
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
 
 
@@ -148,6 +153,7 @@ async def _build_adapter(
     response: EvalResponse | None,
     session: _RecordingSession,
     monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> tuple[Any, _StubEvalClient]:
     from vibe.app_server._runtime import HarnessProcess
     from vibe.app_server._unified_harness_backend_adapter import (
@@ -155,7 +161,7 @@ async def _build_adapter(
         UnifiedSessionSettings,
     )
 
-    process = HarnessProcess()
+    process = HarnessProcess(services=process_services)
     built = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
     )
@@ -184,7 +190,10 @@ def _model_aliases(adapter: Any) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_unified_experiment_variants_reach_the_live_model_catalog(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -195,6 +204,7 @@ async def test_unified_experiment_variants_reach_the_live_model_catalog(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     assert _ROUTED_ALIAS not in _model_aliases(adapter)
 
@@ -208,7 +218,10 @@ async def test_unified_experiment_variants_reach_the_live_model_catalog(
 
 @pytest.mark.asyncio
 async def test_unified_experiment_reports_its_surface_to_growthbook(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.core.experiments.active import ExperimentSurface
@@ -219,6 +232,7 @@ async def test_unified_experiment_reports_its_surface_to_growthbook(
         response=_extra_models_response(),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     await adapter.initialize_experiments(_launch_context())
@@ -230,8 +244,51 @@ async def test_unified_experiment_reports_its_surface_to_growthbook(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("experiment_prompt", "user_prompt", "custom"),
+    [("cli_ml4_2026-10_v2", None, False), (None, "cli_2026-08_v3", True)],
+)
+async def test_unified_custom_system_prompt_ignores_the_experiment_prompt(
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    experiment_prompt: str | None,
+    user_prompt: str | None,
+    custom: bool,
+    process_services: ProcessServices,
+) -> None:
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    from vibe.core.config.layers.growthbook import GrowthbookLayer
+
+    _enable_experiments(config_dir, system_prompt_id=user_prompt)
+    adapter, client = await _build_adapter(
+        tmp_path,
+        response=_extra_models_response(),
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
+    )
+    if experiment_prompt is not None:
+        # A session opens with the previous eval's cached variants applied.
+        orchestrator = adapter._context.config_orchestrator
+        layer = orchestrator.get_layer(GrowthbookLayer.NAME)
+        assert isinstance(layer, GrowthbookLayer)
+        layer.set_variants({"vibe_cli_system_prompt": experiment_prompt})
+        await orchestrator.reload()
+        assert orchestrator.config.system_prompt_id == experiment_prompt
+
+    await adapter.initialize_experiments(_launch_context())
+
+    assert client.attributes is not None
+    assert client.attributes.custom_system_prompt is custom
+
+
+@pytest.mark.asyncio
 async def test_unified_variants_resolved_mid_turn_wait_for_the_next_turn(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -242,6 +299,7 @@ async def test_unified_variants_resolved_mid_turn_wait_for_the_next_turn(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     await adapter.initialize_experiments(_launch_context())
@@ -260,7 +318,10 @@ async def test_unified_variants_resolved_mid_turn_wait_for_the_next_turn(
 
 @pytest.mark.asyncio
 async def test_unified_experiments_are_skipped_when_the_ab_opt_out_is_set(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -271,6 +332,7 @@ async def test_unified_experiments_are_skipped_when_the_ab_opt_out_is_set(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     await adapter.initialize_experiments(_launch_context())
@@ -281,14 +343,21 @@ async def test_unified_experiments_are_skipped_when_the_ab_opt_out_is_set(
 
 @pytest.mark.asyncio
 async def test_unified_failed_eval_leaves_the_session_as_it_opened(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
     _enable_experiments(config_dir)
     session = _RecordingSession()
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=session, monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=session,
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     opened_with = _model_aliases(adapter)
 
@@ -300,7 +369,10 @@ async def test_unified_failed_eval_leaves_the_session_as_it_opened(
 
 @pytest.mark.asyncio
 async def test_unified_experiment_initialization_never_raises(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -311,6 +383,7 @@ async def test_unified_experiment_initialization_never_raises(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     async def _explode(_attributes: ExperimentAttributes) -> EvalResponse | None:
@@ -325,7 +398,10 @@ async def test_unified_experiment_initialization_never_raises(
 
 @pytest.mark.asyncio
 async def test_unified_session_teardown_closes_the_eval_client(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -336,6 +412,7 @@ async def test_unified_session_teardown_closes_the_eval_client(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     await adapter.initialize_experiments(_launch_context())
 
@@ -347,7 +424,10 @@ async def test_unified_session_teardown_closes_the_eval_client(
 
 @pytest.mark.asyncio
 async def test_unified_resolved_variants_carry_to_the_next_session_through_the_cache(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._runtime import HarnessProcess
@@ -360,19 +440,23 @@ async def test_unified_resolved_variants_carry_to_the_next_session_through_the_c
         response=_extra_models_response(),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     await adapter.initialize_experiments(_launch_context())
 
-    reopened = await HarnessProcess().build_unified_session_context(
-        SessionOptions(cwd=str(tmp_path))
-    )
+    reopened = await HarnessProcess(
+        services=process_services
+    ).build_unified_session_context(SessionOptions(cwd=str(tmp_path)))
 
     assert _ROUTED_ALIAS in reopened.config_orchestrator.config.available_models()
 
 
 @pytest.mark.asyncio
 async def test_the_experiment_task_is_handed_to_the_server_as_a_done_callback(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._unified_harness_backend_adapter import (
@@ -385,6 +469,7 @@ async def test_the_experiment_task_is_handed_to_the_server_as_a_done_callback(
         response=_extra_models_response(),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     services = _RecordingServices()
     host = UnifiedHarnessBackendHostAdapter(
@@ -405,7 +490,10 @@ async def test_the_experiment_task_is_handed_to_the_server_as_a_done_callback(
 
 @pytest.mark.asyncio
 async def test_closing_a_session_drops_an_eval_still_in_flight(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import asyncio
@@ -417,6 +505,7 @@ async def test_closing_a_session_drops_an_eval_still_in_flight(
         response=_extra_models_response(),
         session=session,
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     hung = asyncio.Event()
 
@@ -464,7 +553,11 @@ def _runnable_catalog(model_id: str) -> Any:
 
 
 async def _adapter_fetching(
-    tmp_path: Path, session: _RecordingSession, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    session: _RecordingSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    process_services: ProcessServices,
 ) -> tuple[Any, AsyncMock]:
     import vibe.app_server._unified_harness_backend_adapter as adapter_module
 
@@ -474,7 +567,11 @@ async def _adapter_fetching(
         AsyncMock(return_value=_runnable_catalog("fetched-model")),
     )
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=session, monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=session,
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     announced = AsyncMock()
     monkeypatch.setattr(adapter, "_announce_runtime", announced)
@@ -484,11 +581,13 @@ async def _adapter_fetching(
 
 @pytest.mark.asyncio
 async def test_unified_fetched_catalog_reaches_the_live_model_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     session = _RecordingSession()
-    adapter, announced = await _adapter_fetching(tmp_path, session, monkeypatch)
+    adapter, announced = await _adapter_fetching(
+        tmp_path, session, monkeypatch, process_services=process_services
+    )
 
     await adapter._fetch_model_catalog()
 
@@ -499,11 +598,13 @@ async def test_unified_fetched_catalog_reaches_the_live_model_list(
 
 @pytest.mark.asyncio
 async def test_unified_catalog_fetched_mid_turn_waits_for_the_next_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     session = _RecordingSession(active_turn_id="turn-1")
-    adapter, announced = await _adapter_fetching(tmp_path, session, monkeypatch)
+    adapter, announced = await _adapter_fetching(
+        tmp_path, session, monkeypatch, process_services=process_services
+    )
 
     await adapter._fetch_model_catalog()
     mid_turn_aliases = _model_aliases(adapter)
@@ -517,11 +618,13 @@ async def test_unified_catalog_fetched_mid_turn_waits_for_the_next_turn(
 
 @pytest.mark.asyncio
 async def test_unified_fetch_returning_the_same_catalog_announces_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     session = _RecordingSession()
-    adapter, announced = await _adapter_fetching(tmp_path, session, monkeypatch)
+    adapter, announced = await _adapter_fetching(
+        tmp_path, session, monkeypatch, process_services=process_services
+    )
     await adapter._fetch_model_catalog()
 
     await adapter._fetch_model_catalog()
@@ -532,7 +635,10 @@ async def test_unified_fetch_returning_the_same_catalog_announces_nothing(
 
 @pytest.mark.asyncio
 async def test_unified_pin_on_a_catalog_alias_selects_the_fetched_model(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.app_server._unified_harness_backend_adapter as adapter_module
@@ -556,7 +662,11 @@ async def test_unified_pin_on_a_catalog_alias_selects_the_fetched_model(
         adapter_module, "fetch_and_cache_model_catalog", AsyncMock(return_value=catalog)
     )
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     monkeypatch.setattr(adapter, "_announce_runtime", AsyncMock())
     monkeypatch.setattr(adapter, "wait_announced", AsyncMock())
@@ -577,7 +687,10 @@ def _write_user_config(config_dir: Path, **fields: object) -> None:
 
 @pytest.mark.asyncio
 async def test_unified_readiness_waits_for_the_catalog_an_unpinned_session_needs(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.app_server._unified_harness_backend_adapter as adapter_module
@@ -591,7 +704,11 @@ async def test_unified_readiness_waits_for_the_catalog_an_unpinned_session_needs
 
     monkeypatch.setattr(adapter_module, "fetch_and_cache_model_catalog", _slow_fetch)
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     monkeypatch.setattr(adapter, "_announce_runtime", AsyncMock())
     monkeypatch.setattr(adapter, "wait_announced", AsyncMock())
@@ -613,7 +730,10 @@ async def test_unified_readiness_waits_for_the_catalog_an_unpinned_session_needs
 
 @pytest.mark.asyncio
 async def test_unified_readiness_skips_the_catalog_for_a_locally_defined_pin(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.app_server._unified_harness_backend_adapter as adapter_module
@@ -627,7 +747,11 @@ async def test_unified_readiness_skips_the_catalog_for_a_locally_defined_pin(
 
     monkeypatch.setattr(adapter_module, "fetch_and_cache_model_catalog", _slow_fetch)
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     adapter._start_model_catalog_fetch()
@@ -642,7 +766,10 @@ async def test_unified_readiness_skips_the_catalog_for_a_locally_defined_pin(
 
 @pytest.mark.asyncio
 async def test_unified_sessions_stop_waiting_once_a_catalog_fetch_failed(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.core.model_catalog.session as session_module
@@ -667,14 +794,22 @@ async def test_unified_sessions_stop_waiting_once_a_catalog_fetch_failed(
         lambda _config: (MagicMock(), "test-key"),
     )
     first, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     first._start_model_catalog_fetch()
     assert first._model_catalog_wait is not None
     await first.dispatch_extension("session/ready/wait", {})
 
     second, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     second._start_model_catalog_fetch()
     cleared = _replacement_adapter(first)
@@ -707,7 +842,10 @@ def _replacement_adapter(source: Any) -> Any:
 
 @pytest.mark.asyncio
 async def test_unified_a_restored_pin_only_the_catalog_defines_runs_once_ready(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._session_model import set_session_active_model_override
@@ -722,7 +860,11 @@ async def test_unified_a_restored_pin_only_the_catalog_defines_runs_once_ready(
 
     monkeypatch.setattr(adapter_module, "fetch_and_cache_model_catalog", _slow_fetch)
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     monkeypatch.setattr(adapter, "_announce_runtime", AsyncMock())
     monkeypatch.setattr(adapter, "wait_announced", AsyncMock())
@@ -746,7 +888,10 @@ async def test_unified_a_restored_pin_only_the_catalog_defines_runs_once_ready(
 
 @pytest.mark.asyncio
 async def test_unified_sessions_stop_waiting_once_a_fetch_outlasts_the_cap(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.app_server._unified_harness_backend_adapter as adapter_module
@@ -761,7 +906,11 @@ async def test_unified_sessions_stop_waiting_once_a_fetch_outlasts_the_cap(
     monkeypatch.setattr(adapter_module, "fetch_and_cache_model_catalog", _stuck_fetch)
     monkeypatch.setattr(wait_module, "MODEL_CATALOG_WAIT_CAP_SECONDS", 0.05)
     first, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     first._start_model_catalog_fetch()
 
@@ -771,7 +920,11 @@ async def test_unified_sessions_stop_waiting_once_a_fetch_outlasts_the_cap(
 
     assert result.response.ready is True
     second, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     second._start_model_catalog_fetch()
     cleared = _replacement_adapter(first)
@@ -787,7 +940,10 @@ async def test_unified_sessions_stop_waiting_once_a_fetch_outlasts_the_cap(
 
 @pytest.mark.asyncio
 async def test_unified_no_mistral_credential_means_no_wait(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.core.telemetry.send as telemetry_send
@@ -797,7 +953,11 @@ async def test_unified_no_mistral_credential_means_no_wait(
         telemetry_send, "get_mistral_provider_and_api_key", lambda _config: None
     )
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     adapter._start_model_catalog_fetch()
@@ -845,7 +1005,10 @@ def _hold_eval(
 
 @pytest.mark.asyncio
 async def test_unified_an_uncached_eval_holds_an_unpinned_session_until_it_lands(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -855,6 +1018,7 @@ async def test_unified_an_uncached_eval_holds_an_unpinned_session_until_it_lands
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     released = _hold_eval(client, monkeypatch)
 
@@ -871,7 +1035,10 @@ async def test_unified_an_uncached_eval_holds_an_unpinned_session_until_it_lands
 
 @pytest.mark.asyncio
 async def test_unified_a_pinned_session_does_not_wait_for_the_eval(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -881,6 +1048,7 @@ async def test_unified_a_pinned_session_does_not_wait_for_the_eval(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
 
     _start_experiments(adapter)
@@ -893,7 +1061,10 @@ async def test_unified_a_pinned_session_does_not_wait_for_the_eval(
 
 @pytest.mark.asyncio
 async def test_unified_a_reopened_session_with_a_pinned_model_does_not_wait(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._session_model import set_session_active_model_override
@@ -905,6 +1076,7 @@ async def test_unified_a_reopened_session_with_a_pinned_model_does_not_wait(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     # What a reopened session does with the model its first turn pinned.
     assert not await set_session_active_model_override(
@@ -923,7 +1095,10 @@ async def test_unified_a_reopened_session_with_a_pinned_model_does_not_wait(
 
 @pytest.mark.asyncio
 async def test_unified_a_cached_eval_means_no_wait(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -933,6 +1108,7 @@ async def test_unified_a_cached_eval_means_no_wait(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(first)
     assert first._experiments_wait is not None
@@ -945,6 +1121,7 @@ async def test_unified_a_cached_eval_means_no_wait(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(second)
 
@@ -956,20 +1133,31 @@ async def test_unified_a_cached_eval_means_no_wait(
 
 @pytest.mark.asyncio
 async def test_unified_sessions_stop_waiting_once_an_eval_failed(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
     _unpin_with_experiments(config_dir)
     first, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(first)
     assert first._experiments_wait is not None
     await asyncio.wait_for(first._wait_for_first_turn_fetches(), timeout=2)
 
     second, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(second)
 
@@ -982,7 +1170,10 @@ async def test_unified_sessions_stop_waiting_once_an_eval_failed(
 
 @pytest.mark.asyncio
 async def test_unified_sessions_stop_waiting_once_an_eval_outlasts_the_cap(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.core.experiments.wait as wait_module
@@ -994,6 +1185,7 @@ async def test_unified_sessions_stop_waiting_once_an_eval_outlasts_the_cap(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _hold_eval(client, monkeypatch)
     _start_experiments(first)
@@ -1008,7 +1200,11 @@ async def test_unified_sessions_stop_waiting_once_an_eval_outlasts_the_cap(
     # Readiness still waits for the whole eval, for the startup telemetry.
     assert not ready.done()
     second, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(second)
     assert second._experiments_wait is None
@@ -1021,7 +1217,10 @@ async def test_unified_sessions_stop_waiting_once_an_eval_outlasts_the_cap(
 
 @pytest.mark.asyncio
 async def test_unified_an_eval_outlasting_the_cap_in_a_pinned_session_stops_later_waits(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.core.experiments.wait as wait_module
@@ -1033,6 +1232,7 @@ async def test_unified_an_eval_outlasting_the_cap_in_a_pinned_session_stops_late
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _hold_eval(client, monkeypatch)
     _start_experiments(pinned)
@@ -1043,7 +1243,11 @@ async def test_unified_an_eval_outlasting_the_cap_in_a_pinned_session_stops_late
     assert experiments_eval_failed() is True
     _unpin_with_experiments(config_dir)
     unpinned, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     _start_experiments(unpinned)
     assert unpinned._experiments_wait is None
@@ -1055,7 +1259,10 @@ async def test_unified_an_eval_outlasting_the_cap_in_a_pinned_session_stops_late
 
 @pytest.mark.asyncio
 async def test_unified_a_cache_written_after_the_session_was_built_still_waits(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
@@ -1065,12 +1272,14 @@ async def test_unified_a_cache_written_after_the_session_was_built_still_waits(
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     first, _client = await _build_adapter(
         tmp_path,
         response=routing_eval_response(_ROUTED_ALIAS),
         session=_RecordingSession(),
         monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     # Another session's eval writes the cache before this one opens.
     await first.initialize_experiments(_launch_context())
@@ -1085,7 +1294,10 @@ async def test_unified_a_cache_written_after_the_session_was_built_still_waits(
 
 @pytest.mark.asyncio
 async def test_unified_a_slow_lookup_without_an_eval_is_not_an_eval_failure(
-    tmp_path: Path, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    config_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     import vibe.core.experiments.wait as wait_module
@@ -1094,7 +1306,11 @@ async def test_unified_a_slow_lookup_without_an_eval_is_not_an_eval_failure(
     _enable_experiments(config_dir, enable=False)
     monkeypatch.setattr(wait_module, "EVAL_WAIT_CAP_SECONDS", 0.05)
     adapter, _client = await _build_adapter(
-        tmp_path, response=None, session=_RecordingSession(), monkeypatch=monkeypatch
+        tmp_path,
+        response=None,
+        session=_RecordingSession(),
+        monkeypatch=monkeypatch,
+        process_services=process_services,
     )
     released = asyncio.Event()
 

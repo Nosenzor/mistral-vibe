@@ -32,6 +32,8 @@ pub mod key {
 pub mod action {
     pub const NAVIGATE: &str = "navigate";
     pub const SELECT: &str = "select";
+    pub const OPEN: &str = "open";
+    pub const FULL_CHANGELOG: &str = "full changelog";
     pub const SAVE: &str = "save";
     pub const SESSION_ONLY: &str = "session only";
     pub const CANCEL: &str = "cancel";
@@ -79,6 +81,8 @@ pub mod action {
     pub const REMOVE: &str = "remove";
     pub const DISCARD: &str = "discard";
     pub const SUBMIT_AS_NEW: &str = "submit as new";
+    pub const SHOW: &str = "show";
+    pub const HIDE: &str = "hide";
 }
 
 pub const NAVIGATE: Hint = (key::NAV, action::NAVIGATE);

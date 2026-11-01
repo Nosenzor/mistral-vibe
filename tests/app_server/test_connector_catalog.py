@@ -117,11 +117,11 @@ async def test_manage_connectors_url_none_when_identity_incomplete(monkeypatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scope", "expected"),
-    [("shared_only", True), ("personal_and_shared", False), (None, False)],
+    ("can_access_private_resources", "expected"),
+    [(False, True), (True, False), (None, False)],
 )
-async def test_private_connectors_hidden_only_for_shared_only_keys(
-    monkeypatch, scope: str | None, expected: bool
+async def test_private_connectors_hidden_from_account_context(
+    monkeypatch, can_access_private_resources: bool | None, expected: bool
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
@@ -131,7 +131,9 @@ async def test_private_connectors_hidden_only_for_shared_only_keys(
         connector_catalog, "_resolve_provider", lambda _config: provider
     )
     whoami = WhoAmIResult(
-        plan_type=AccountPlanKind.API, plan_name="FREE", primitive_access_scope=scope
+        plan_type=AccountPlanKind.CHAT,
+        plan_name="FREE",
+        can_access_private_resources=can_access_private_resources,
     )
     resolve = AsyncMock(return_value=whoami)
     monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
@@ -168,7 +170,7 @@ async def test_private_connectors_hidden_retries_whoami_only_after_cooldown(
     resolve.return_value = WhoAmIResult(
         plan_type=AccountPlanKind.API,
         plan_name="FREE",
-        primitive_access_scope="shared_only",
+        can_access_private_resources=False,
     )
 
     assert await connector_catalog._private_connectors_hidden(config) is True
@@ -198,7 +200,7 @@ async def test_private_connectors_hidden_reads_disk_cache_during_cooldown(
         WhoAmIResult(
             plan_type=AccountPlanKind.API,
             plan_name="FREE",
-            primitive_access_scope="shared_only",
+            can_access_private_resources=False,
         ),
     )
 
@@ -740,6 +742,92 @@ async def test_a_failed_bootstrap_answers_the_next_callers_until_it_retries(
     # Assert
     assert fetches_in_window == 1
     assert recovered is not None
+    assert fetches == 2
+
+
+@pytest.mark.parametrize(("status", "fails"), [(404, False), (503, True)])
+@pytest.mark.asyncio
+async def test_a_server_without_a_connector_service_has_no_connectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int, fails: bool
+) -> None:
+    """*Prepare*: A server answering the bootstrap with 404, as one without the
+      connector service does (self-hosted, Private Cloud, a proxy), or 503.
+    *Do*: Resolve the catalog.
+    *Assert*: A 404 is an empty catalog, not a failure to warn about; a 503
+      still fails.
+    """
+    import httpx2
+
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    async def fetch(
+        base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        request = httpx2.Request("GET", f"{base_url}/v1/connectors/bootstrap")
+        response = httpx2.Response(status, request=request)
+        raise httpx2.HTTPStatusError("bootstrap", request=request, response=response)
+
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    # Do
+    try:
+        catalog = await service.resolve_catalog(_orchestrator())
+        error = None
+    except ConnectorCatalogUnavailableError as exc:
+        catalog, error = None, exc
+
+    # Assert
+    if fails:
+        assert error is not None
+        assert "HTTP 503" in str(error)
+    else:
+        assert error is None
+        assert catalog is not None
+        assert catalog.connectors == ()
+
+
+@pytest.mark.asyncio
+async def test_a_failure_nobody_remembers_leaves_the_next_caller_to_fetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A connector backend that fails, with no cached catalog.
+    *Do*: Resolve without remembering the failure, as the app server's warm-up
+      does, then resolve again at once, as a session does.
+    *Assert*: The session's resolve fetches again instead of inheriting the
+      warm-up's failure.
+    """
+    # Prepare
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    fetches = 0
+
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        raise TimeoutError("connectors backend is down")
+
+    orchestrator = _orchestrator()
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    # Do
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator, remember_failure=False)
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+
+    # Assert
     assert fetches == 2
 
 
@@ -2092,7 +2180,7 @@ async def test_connect_http_failure_reads_as_a_sentence_without_the_body(
     *Assert*: The message explains the status and never echoes the response body.
     """
     # Prepare
-    respx.post(
+    respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(status, json={"detail": "internal trace id abc123"})
     provider = connector_catalog._ConnectorProvider(
@@ -2121,7 +2209,7 @@ async def test_connect_without_credentials_creates_the_default_user_connection()
     *Assert*: It posts an empty default user connection, as the dashboard does.
     """
     # Prepare
-    route = respx.post(
+    route = respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(json={"message": "ok"})
     provider = connector_catalog._ConnectorProvider(

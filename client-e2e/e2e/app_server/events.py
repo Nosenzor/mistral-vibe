@@ -358,9 +358,9 @@ def hook_completed(
     )
 
 
-def server_warning(message: str) -> AppServerEvent:
+def server_warning(message: str, *, code: str = "warning") -> AppServerEvent:
     """Build a server-pushed operational warning (Python `ServerWarning`)."""
-    return _event("warning", {"warning": {"code": "warning", "message": message}})
+    return _event("warning", {"warning": {"code": code, "message": message}})
 
 
 def runtime_updated(
@@ -1072,12 +1072,16 @@ def web_fetch_without_output(url: str) -> AppServerEvent:
 
 
 def _callback_entry(
-    questions: list[dict[str, Any]], footer_note: str | None, callback_id: str
+    questions: list[dict[str, Any]],
+    footer_note: str | None,
+    callback_id: str,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     return _entry(
         "callback",
         entry_id=callback_id,
         generation_status="in_progress",
+        session_id=session_id,
         callbackId=callback_id,
         title="User input required",
         detail={
@@ -1094,9 +1098,10 @@ def ask_user_question_added(
     *,
     footer_note: str | None = None,
     callback_id: str = "callback-ask_user_question",
+    session_id: str | None = None,
 ) -> AppServerEvent:
     """Build the callback history entry the projector broadcasts alongside the call."""
-    return _added(_callback_entry(questions, footer_note, callback_id))
+    return _added(_callback_entry(questions, footer_note, callback_id, session_id))
 
 
 def ask_user_question_answered(
@@ -1128,9 +1133,10 @@ def ask_user_question(
     footer_note: str | None = None,
     callback_id: str = "callback-ask_user_question",
     request_id: int = 9001,
+    session_id: str | None = None,
 ) -> AppServerEvent:
     """Build the server-to-client `callback/call` an `ask_user_question` tool opens."""
-    entry = _callback_entry(questions, footer_note, callback_id)
+    entry = _callback_entry(questions, footer_note, callback_id, session_id)
     event = _event("callback/call", {"callback": entry})
     event["id"] = request_id
     return event
@@ -1568,4 +1574,58 @@ def worktree(
             },
         ),
         session_id,
+    )
+
+
+def artifact(
+    artifact_id: str,
+    *,
+    number: int,
+    url: str,
+    discovered_at: str,
+    provider: str = "github",
+    display_title: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """One session artifact (PublicSessionArtifact) as the server sends it."""
+    details: dict[str, Any]
+    if provider == "gitlab":
+        details = {
+            "kind": "pull_request",
+            "schemaVersion": 1,
+            "repoHost": "gitlab.com",
+            "repoId": 42,
+            "projectPath": "mistral-ai/vibe",
+            "mergeRequestIid": number,
+        }
+        external_key = f"gitlab.com/42/merge_requests/{number}"
+    else:
+        details = {
+            "kind": "pull_request",
+            "schemaVersion": 1,
+            "repoHost": "github.com",
+            "repoOwner": "mistral-ai",
+            "repoName": "vibe",
+            "pullRequestNumber": number,
+        }
+        external_key = f"github.com/mistral-ai/vibe/pull/{number}"
+    return {
+        "id": artifact_id,
+        "sessionId": session_id or SESSION_ID,
+        "kind": "pull_request",
+        "provider": provider,
+        "externalKey": external_key,
+        "externalUrl": url,
+        "displayTitle": display_title,
+        "discoveredAt": discovered_at,
+        "viewedAt": None,
+        "details": details,
+    }
+
+
+def artifact_created(artifact: dict[str, Any]) -> AppServerEvent:
+    """The `artifacts/created` notification announcing a discovered artifact."""
+    return _event(
+        "artifacts/created",
+        {"sessionId": SESSION_ID, "emittedAt": _TIMESTAMP, "artifact": artifact},
     )

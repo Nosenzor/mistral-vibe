@@ -294,9 +294,8 @@ async def test_apply_patch_rejects_invalid_schema_result_before_routing() -> Non
             reason="test invalid patch",
         )
 
-    assert exc_info.value.args == (
-        "Config patch failed preflight validation against the merged config; fix the patch payload and retry",
-    )
+    # The schema's issue, so the caller can say what to change.
+    assert exc_info.value.args == ("value: Input should be a valid string",)
     assert isinstance(exc_info.value.__cause__, ValidationError)
 
 
@@ -1135,3 +1134,26 @@ async def test_orchestrator_deepcopies_and_stays_functional() -> None:
 
     assert forked.config.value == "forked"
     assert orch.config.value == "hello"
+
+
+@pytest.mark.asyncio
+async def test_reload_layer_reports_a_schema_break_as_a_config_error() -> None:
+    """*Prepare*: A loaded config; one layer then breaks the schema.
+    *Do*: Re-read that layer alone.
+    *Assert*: The readable config error, as ``reload`` raises, and the
+    previous snapshot is kept.
+    """
+    from vibe.core.config.builder import InvalidConfigError
+
+    # Prepare
+    layer = FakeLayer(name="admin", data={"value": "original"})
+    orch = await ConfigOrchestrator.create(
+        schema=SimpleSchema, layers=[layer], default_layer_resolver=lambda: layer
+    )
+    layer._data = {"value": 42}
+
+    # Do / Assert
+    with pytest.raises(InvalidConfigError):
+        await orch.reload_layer("admin")
+
+    assert orch.config.value == "original"

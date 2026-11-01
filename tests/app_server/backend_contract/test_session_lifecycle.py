@@ -12,6 +12,7 @@ from tests.app_server.backend_contract.conftest import (
     BackendContractConnection,
     connect_backend_contract_host,
 )
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server.local import LocalHarnessHost, LocalHarnessOptions
 from vibe.app_server.models import PublicMessageEntry
 from vibe.app_server.protocol import (
@@ -34,15 +35,17 @@ async def test_session_start_returns_the_attached_public_session(
 
 @pytest.mark.asyncio
 async def test_unified_session_advertises_only_supported_agent_tools(
-    backend_contract_mistral_api: respx.Route, tmp_path: Path
+    backend_contract_mistral_api: respx.Route,
+    tmp_path: Path,
+    process_services: ProcessServices,
 ) -> None:
-    """*Prepare*: A local Unified Harness session and usage-free provider chunks.
+    """*Prepare*: A local Unified Harness session and scripted provider chunks.
     *Do*: Start a turn and discover the agent tool declarations.
     *Assert*: Local child tools are available without conversation forks; waiting
               is the standalone direct ``wait`` tool, not an ``agents`` function.
     """
     # Prepare
-    # Accounting is covered separately; optional provider usage is omitted here.
+    # Accounting is covered separately; every reply still reports its usage.
     choices = [
         {
             "index": 0,
@@ -86,6 +89,11 @@ async def test_unified_session_advertises_only_supported_agent_tools(
                     "created": 1234567890,
                     "model": "mistral-vibe-cli-latest",
                     "choices": [choice],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
                 })
                 + "\n\ndata: [DONE]\n",
                 headers={"Content-Type": "text/event-stream"},
@@ -96,6 +104,7 @@ async def test_unified_session_advertises_only_supported_agent_tools(
     connection = await connect_backend_contract_host(
         session_options=SessionOptions(cwd=str(tmp_path)),
         capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     try:
         # Do
@@ -118,7 +127,7 @@ async def test_unified_session_advertises_only_supported_agent_tools(
     assert "declare namespace tools.agents" in declarations
     for operation in ("list", "spawn", "send_message", "interrupt"):
         assert f"function {operation}(" in declarations
-    assert "fork_turns" not in declarations
+    assert "context?:" not in declarations
     assert "function wait(" not in declarations
 
 
@@ -220,6 +229,7 @@ async def test_detached_fork_is_readable_and_resumable_from_a_new_host(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_session: AppServerSession,
+    process_services: ProcessServices,
 ) -> None:
     backend_contract_mistral_api.mock(
         return_value=backend_contract_mistral_response("First answer")
@@ -235,7 +245,9 @@ async def test_detached_fork_is_readable_and_resumable_from_a_new_host(
     )
 
     connection = await connect_backend_contract_host(
-        session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     resumed: AppServerSession | None = None
     try:
@@ -290,6 +302,7 @@ async def test_continue_attaches_the_latest_persisted_session_and_keeps_it_usabl
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
+    process_services: ProcessServices,
 ) -> None:
     backend_contract_mistral_api.mock(
         side_effect=[
@@ -305,7 +318,9 @@ async def test_continue_attaches_the_latest_persisted_session_and_keeps_it_usabl
         await session.close()
 
     continued_connection = await connect_backend_contract_host(
-        session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     continued = await continued_connection.host.continue_session()
     try:
@@ -326,6 +341,7 @@ async def test_resume_attaches_the_requested_persisted_session_and_keeps_it_usab
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
+    process_services: ProcessServices,
 ) -> None:
     backend_contract_mistral_api.mock(
         side_effect=[
@@ -341,7 +357,9 @@ async def test_resume_attaches_the_requested_persisted_session_and_keeps_it_usab
         await session.close()
 
     resumed_connection = await connect_backend_contract_host(
-        session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     resumed = await resumed_connection.host.resume_session(session_id)
     try:

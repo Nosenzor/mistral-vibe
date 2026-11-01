@@ -170,14 +170,19 @@ bottom-right gauge. With an empty or locally edited prompt, press Down from its
 last line to focus the list;
 unsent text stays in the prompt. Use Up and Down to highlight a row, then press
 Enter to open it; with the mouse, hover to highlight and click to open. Select **Main
-conversation** to return, or press Escape from a subagent view. Ctrl+C adds a
+conversation** to return, or press Escape from a subagent view. Escape on
+the focused list returns to the prompt with **Main conversation** selected. Ctrl+C adds a
 local-only, error-styled user message explaining that subagents cannot be
 controlled directly; return to Main and ask the main agent to stop one. Press
 Ctrl+C again to quit Vibe. After
 opening Main conversation, press Up from its row to focus the prompt. While a
-subagent view is open, Up stops at the Main row. Idle subagents remain listed as
-**ready** because the main agent can send them more instructions, and subagents
-whose last turn failed remain listed as **failed**. Explicitly stopped subagents
+subagent view is open, Up stops at the Main row. Idle subagents are **ready**:
+the main agent can still send them more instructions. Waiting subagents outside
+the running batch are hidden behind a last `N subagents waiting` row; while the
+list is focused, that row offers `a` to show all subagents, and `a` again to
+hide the waiting ones. Once shown, the list keeps its Main row for the rest of
+the session; switching sessions hides the waiting subagents again. Subagents whose last turn failed remain listed as
+**failed**. Hidden waiting subagents still count toward `max_subagents`. Explicitly stopped subagents
 leave the list after you return to Main. The first subagent
 update does not add a local information message. When a subagent becomes ready,
 its transcript shows a local information message explaining how to give it a
@@ -259,7 +264,7 @@ Most modern terminals should work, but older or minimal terminal emulators may h
 Simply run `vibe` to enter the interactive chat loop. The terminal UI is a native
 Rust binary (`vibe-rs`) bundled with the package.
 
-- **Multi-line Input**: Press `Ctrl+J` or `Shift+Enter` for select terminals to insert a newline.
+- **Multi-line Input**: Press `Ctrl+J`, or `Shift+Enter` / `Alt+Enter` in terminals that report them, to insert a newline.
 - **Input Cursor**: The main input cursor blinks by default. Set `cursor_blink = false` in `config.toml` for a steady cursor. Changes apply without restarting through `/config` or `/reload`.
 - **File Paths**: Reference files in your prompt using the `@` symbol for smart autocompletion (e.g., `> Read the file @src/agent.py`). A bare `@` quickly lists immediate non-hidden entries; after a path character, Git workspaces suggest tracked and non-ignored files. Pasting a standalone existing absolute or home-relative file or folder also creates a mention.
 - **Shell Commands**: Prefix any command with `!` to execute it directly in your shell, bypassing the agent (e.g., `> !ls -l`).
@@ -315,6 +320,7 @@ When using `--prompt`, you can specify additional options:
 - **`--max-price DOLLARS`**: Set a maximum cost limit in dollars for this run. The turn is interrupted once the cost exceeds this limit, and the outcome is `price_limit`.
 - **`--max-tokens N`**: Set a maximum cumulative LLM token budget for this run, counting both prompt and completion tokens. The turn is interrupted once usage exceeds this limit, and the outcome is `token_limit`.
 - **`--agent NAME`**: Select the agent profile for this run.
+- **`--model ALIAS`**: Use this model alias for the run instead of `active_model`, without saving it as the default. Only for a new session; an unknown alias is a usage error.
 - **`--auto-approve`, `--yolo`**: Approves all tool calls without prompting, including in interactive sessions. Can be combined with any `--agent` value.
 - **`--enabled-tools TOOL`**: Enable specific tools. In programmatic mode, this disables all other tools. Can be specified multiple times. Supports exact names, glob patterns (e.g., `bash*`), or regex with `re:` prefix (e.g., `re:^serena_.*$`).
 - **`--disabled-tools TOOL`**: Disable specific tools after `--enabled-tools` filtering. Can be specified multiple times. Supports exact names, glob patterns (e.g., `bash*`), or regex with `re:` prefix (e.g., `re:^serena_.*$`).
@@ -325,6 +331,7 @@ When using `--prompt`, you can specify additional options:
 
   On a resumed session, `text` and `streaming` cover only the new run, so a run that ends without a reply of its own prints none; `json` holds the whole session.
 - **`--prompt-file PATH`**: Read the prompt from a file instead of `--prompt`. With `-p` and no text, the prompt is read from stdin.
+- **`--system-prompt-file PATH`**: Replace Vibe's own instructions in the system prompt, and the agent's, with the file's text. The harness's general guidance still comes first, and the project context, `AGENTS.md` files and tool instructions still follow it. An empty or unreadable file is a usage error.
 - **`--time-limit SECONDS`**: Stop the run after this many seconds. The active turn and its tool processes are stopped, and the session can be resumed with `--resume`. SIGTERM stops a run the same way.
 - **`--output-dir DIR`**: Write `DIR/export.json` and copy the session journal to `DIR/session/`, whichever way the run ends. The export records the Vibe version, the effective config (header and environment values redacted), token usage, cost, the number of model calls the agent made (`steps`), the stop reason and the outcome. When the session had config issues, such as a skill or a config file it could not load, the export lists them under `warnings`, each as `{"message": str, "source": str | null}`, where `source` names the file or skill it is about; the field is left out when there are none, and the run goes on regardless. Usage, cost and `steps` count this run only, also on a resumed session, while the copied journal holds the whole session. Only an argument the parser itself rejects (an unknown flag, a malformed value) exits 1 without an export.
 
@@ -342,7 +349,7 @@ vibe --prompt-file task.md --auto-approve --time-limit 1800 --output-dir out/
 | `0` | `finished` | The agent finished. |
 | `1` | `usage_error`, `config_error` | The run could not start as asked. |
 | `2` | `infrastructure_failure` | The model API (after retries) or the runtime failed. |
-| `3` | `turn_limit`, `token_limit`, `price_limit`, `deadline`, `terminated`, `length`, `refusal` | The agent stopped without finishing; score what it left. `length` means the conversation or the last answer hit a model token limit: the context window, or the output-token cap (`max_output_tokens` on the model). An answer cut off at the output cap is first discarded and asked for again, up to `output_limit_retries` times (6 by default). `refusal` means the model declined to answer. |
+| `3` | `turn_limit`, `token_limit`, `price_limit`, `deadline`, `terminated`, `length`, `refusal` | The agent stopped without finishing; score what it left. `length` means the conversation or the last answer hit a model token limit: the context window, or the output-token cap (`agent_max_output_tokens`, else the model's `max_output_tokens` where the provider requires a cap). An answer cut off at the output cap is first discarded and asked for again, up to `output_limit_retries` times (6 by default). `refusal` means the model declined to answer. |
 | `4` | `aborted` | The `--agent-socket` server aborted the run (experimental, see below); `error.message` in `export.json` is the server's message. |
 
 `vibe -p` exits only after its app-server process has, however the run ends.
@@ -632,6 +639,11 @@ by about 45 KiB per run; with two arenas it stays flat.
 
 Voice mode allows you to dictate input using your microphone instead of typing.
 
+In editor integrations (`vibe-acp`), dictation and narration use the `miniaudio`
+package, installed by default on macOS, Windows and x86_64 Linux. On other
+platforms, install the `voice` extra, which may build it from source:
+`uv tool install "mistral-vibe[voice]"`.
+
 ### Activating Voice Mode
 
 Toggle voice mode on or off with the `/voice` slash command:
@@ -906,22 +918,34 @@ use the latest compacted context followed by newer messages.
 These settings apply to the Unified Harness:
 
 ```toml
-compaction_max_output_tokens = 80000       # Output cap for compaction requests; 0: same cap as other requests
-# compaction_thinking = "low"              # Thinking for the first compaction request; unset keeps the compaction model's level
-compaction_reasoning_limit_tokens = 32000  # Reasoning after which compaction falls back; 0 disables
+# auto_compact_threshold = 200000         # Compaction threshold for models without their own; unset: derived from the window
+compaction_reasoning_limit_tokens = 32000  # Reasoning after which a compaction summary is asked for again, briefly; 0 disables
 output_limit_retries = 6                   # Cut-off answers a turn retries with feedback; 0 ends the turn on the first
-output_token_reserve = 4096                # Tokens kept free when the output cap is clipped to the context window
+agent_max_output_tokens = 0                # Output cap of every agent and subagent request, on any provider; 0 sends one only where required
+compaction_max_output_tokens = 0           # Output cap of every compaction request, on any provider; 0 sends one only where required
 ```
 
-The first compaction request reuses the conversation's prompt prefix, so the
-provider can serve most of it from its cache. If it fails, returns an invalid
-summary, or reasons past `compaction_reasoning_limit_tokens`, Vibe sends one
-fallback request instead: a summarizer prompt over a text transcript of the
-conversation, without tools and without reasoning. It differs from the first
-request, so a provider's response cache cannot hand back the same failed answer.
+A nonzero output cap is held to the model's max output and to the room its
+context window leaves above the compaction threshold, so a request's input and
+output fit in the window: with a 262,144-token window and a 202,144-token
+threshold, a cap above 60,000 sends 60,000.
 
-When a model declares `max_context_length`, each request's output cap is clipped
-to the room its input leaves in that window, less `output_token_reserve`.
+The first compaction request reuses the conversation's prompt prefix, so the
+provider can serve most of it from its cache. If it fails or returns an invalid
+summary, Vibe sends one fallback request instead: a summarizer prompt over a
+text transcript of the conversation, without tools and with reasoning off, or at
+the lowest level where the model cannot turn it off. It differs from the first
+request, so a provider's response cache cannot hand back the same failed answer. A summary cut off at the output limit, or a first
+request that reasons past `compaction_reasoning_limit_tokens`, is asked for once
+more as a fallback request that asks for a brief answer. A compaction request
+the provider refuses as too long is sent again, smaller.
+
+Compaction is always automatic. A model's context window is its
+`max_context_length`, else the known window of the model, else 262,144 tokens
+(Vibe then warns that it guessed). Without an `auto_compact_threshold`, the
+threshold is `min(256000, window - 60000)`, kept inside the range the window
+allows; an explicit threshold outside that range is refused with an error
+that names the range. `auto_compact_threshold` must be a positive number of tokens.
 
 ### Custom Title Prompts
 
@@ -1014,6 +1038,21 @@ process tools. It defaults to `true`.
 `enable_subagents = false` likewise takes subagents (`tools.subagent` in
 `run_typescript`) away from the agent on the default runtime: the system prompt
 no longer describes them, and the agent works alone. It defaults to `true`.
+
+`outside_workdir = "deny"` refuses file and shell tool calls that reach outside
+the working directory and its `--add-dir` directories instead of prompting: the
+agent gets a tool error explaining that access is denied by configuration, and
+keeps working. It defaults to `"ask"`. Set it per tool under `[tools.<name>]` to
+override the global value; allowlisted paths stay allowed. Under `"ask"`, a shell
+command reaching outside prompts for that path even when the command is
+allowlisted or the shell has `permission = "always"`.
+
+```toml
+outside_workdir = "deny"
+
+[tools.read_file]
+allowlist = ["vibe-path:directory_recursive:/abs/path/to/shared"]
+```
 
 #### Enable/Disable Tools with Patterns
 
@@ -1135,6 +1174,11 @@ Key fields:
 - `startup_timeout_sec`: Timeout in seconds for the server to start and initialize (default 10s)
 - `tool_timeout_sec`: Timeout in seconds for tool execution (default 60s)
 - `env`: Environment variables to set for the MCP server of transport type stdio
+- `sampling_enabled`: Allow server sampling requests only when explicitly set to
+  `true` and the host supplies a sampling completion handler (default `false`).
+
+The current Vibe app server does not supply a sampling completion handler, so
+MCP servers cannot initiate model completions through sampling in that host.
 
 HTTP MCP servers can use either static auth or OAuth. Both use an `auth` block;
 legacy top-level `api_key_env` / `headers` keys are still accepted and promoted
@@ -1164,7 +1208,7 @@ permission = "ask"
 
 MCP server configurations support additional features:
 
-- **Environment variables**: Set environment variables for MCP servers
+- **Environment variables**: Set environment variables for stdio MCP servers
 - **Custom timeouts**: Configure startup and tool execution timeouts
 
 Example with environment variables and timeouts:
@@ -1172,8 +1216,9 @@ Example with environment variables and timeouts:
 ```toml
 [[mcp_servers]]
 name = "my_server"
-transport = "http"
-url = "http://localhost:8000"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch"]
 env = { "DEBUG" = "1", "LOG_LEVEL" = "info" }
 startup_timeout_sec = 15
 tool_timeout_sec = 120
@@ -1219,9 +1264,19 @@ Unknown JSON fields are tolerated at every level (forward-compatible). Fields th
 
 #### `post_agent`
 
-Fires after every assistant turn that ends without pending tool calls.
+Fires after every assistant turn that ends without pending tool calls, for the main agent and for every subagent.
 
-- **Receives** (in addition to the session context): no extra fields.
+- **Matches** (optional `match`): the agent that finished its turn, by agent configuration name, with the same glob / `re:` syntax as tool hooks. A main session (root or fork) answers to its current agent (`accept-edits`, `ask`, a custom agent) and to the reserved alias `main`; a subagent answers to its `config_name`, or to its parent's agent when spawned without one. `match = "main"` runs only after the main agent; a mode name such as `accept-edits` also matches the subagents that inherit it. Without `match`, the hook runs for every agent. No agent may be named `main`.
+
+  ```toml
+  [[hooks]]
+  name = "build-after-reviewer"
+  type = "post_agent"
+  match = "reviewer"
+  command = "make check"
+  ```
+
+- **Receives** (in addition to the session context): `agent_name`, the agent configuration name (`null` when unknown).
 - **Can return**:
   - `decision: "deny"` + `reason` — `reason` is injected as a new user message asking for a retry. First deny short-circuits remaining `post_agent` hooks. Capped at **3 retries per turn across all `post_agent` hooks**; past the cap, the answer is accepted.
   - `system_message` — UI-only.
@@ -1252,7 +1307,7 @@ Fires per tool call **if and only if the tool body actually ran**. `tool_status`
 
 Vibe supports continuing from previous sessions:
 
-- **`--continue`** or **`-c`**: Continue from the most recent saved session
+- **`--continue`** or **`-c`**: Continue the last session used in this terminal in the current folder, or the folder's most recent session when this terminal has none there. It also works with `-p`. Only sessions of the exact current folder count, not those of its subfolders. Set `VIBE_TERMINAL_KEY` to name the terminal yourself (an empty value makes `-c` ignore the terminal)
 - **`--resume`**: Open an interactive session picker
 - **`--resume SESSION_ID`**: Resume a specific session by ID (supports partial matching)
 - **`/resume`** or **`/continue`**: Open the session picker from inside Vibe; press `D` twice to delete a local saved session. The active session cannot be deleted from this picker.
@@ -1311,6 +1366,10 @@ The worktree lives under `$VIBE_HOME/worktrees/<repo-name>-<repo-hash>/NAME` and
 
 Existing worktrees are reused only when they belong to the same git repository and are checked out on branch `NAME`; otherwise Vibe exits with an error instead of running in the wrong checkout.
 
+Before a folder is trusted, worktree creation disables filters defined by its Git configuration, including conditional includes. If that configuration defines LFS extensions or custom transfers, all content filters are disabled for automatic checkout. Recovery snapshots keep the original checkout when source trust would require disabling filters: already-smudged bytes cannot safely be saved as canonical Git content and smudged again on restore. Ordinary user filters remain available otherwise, except that Git LFS content is left as pointer files until the folder is trusted. On older Git versions without config scope reporting, untrusted automatic operations conservatively disable all content filters. Trusted folders retain their configured filters.
+
+Git filter trust follows the source repository, including session-only trust for live worktree operations. Background recovery snapshots use persisted source trust. Untrusted status does not inspect submodule contents; indexed submodules conservatively count as uncommitted work for fork notices and prevent automatic snapshots and cleanup, even if they are clean or uninitialized.
+
 Pass `--worktree` with no name to have Vibe name one for you:
 
 ```bash
@@ -1350,7 +1409,7 @@ only Git-dependent metadata and features are unavailable.
 
 ### Update Settings
 
-Vibe checks for updates at most once per day during a session. When Vibe is installed from a package index with `uv tool install`, the check runs `uv tool list --outdated`, so your uv settings (such as `exclude-newer`) decide which version is offered, and an exact version pin (`mistral-vibe==X`) suppresses the offer. Other installs (git or local path, Homebrew, pip, or a uv too old for `--outdated`) query PyPI. When a newer version is found, the next launch shows an update prompt before opening the chat, offering to either update immediately (via `uv tool upgrade mistral-vibe` or `brew upgrade mistral-vibe`) or continue with the current version. Vibe reports success only once `vibe --version` shows the new version. If a uv install stays on the old version, for example because of a version pin, Vibe asks whether to run `uv tool install --force mistral-vibe@latest`, which drops the pin, extras and `--with` packages.
+Vibe checks for updates at most once per day during a session. When Vibe is installed from a package index with `uv tool install`, the check runs `uv tool list --outdated`, so your uv settings (such as `exclude-newer`) decide which version is offered, and an exact version pin (`mistral-vibe==X`) suppresses the offer. Other installs (git or local path, Homebrew, pip, or a uv too old for `--outdated`) query PyPI. When a newer version is found, the next launch shows an update prompt before opening the chat, offering to either update immediately (via `uv tool upgrade mistral-vibe` or `brew upgrade mistral-vibe`) or continue with the current version. Vibe reports success only once `vibe --version` shows the new version. If a uv install stays on the old version, for example because of a version pin, Vibe asks whether to run `uv tool install --force mistral-vibe@latest`, which drops the pin, extras and `--with` packages. On Windows, a running Vibe holds its own files open, so "Update now" instead prints the upgrade command to run once every Vibe session (including IDE integrations) is closed.
 
 Run `vibe --check-upgrade` to check immediately, prompt to install a newer version if one exists, and exit.
 
@@ -1385,11 +1444,12 @@ This affects where Vibe looks for:
 - `connector_bootstrap_cache.json` - Short-lived connector discovery cache
 - `agents/` - Custom agent configurations
 - `prompts/` - Custom system and compaction prompts
-- `tools/` - Custom tools
 - `logs/` - Session logs
 
-Custom tools will be deprecated in a future release. Prefer skills for new
-extensions; Vibe can help migrate existing custom tools to skills.
+Custom Python tools are no longer supported. Vibe does not load the `.py` files
+in `~/.vibe/tools/` or `.vibe/tools/` and shows a warning at startup for each
+one. To keep a tool, ask Vibe to migrate it to a skill. Vibe also removes the
+former `tool_paths` setting from `config.toml`; the files it listed stay on disk.
 
 ### Logging
 

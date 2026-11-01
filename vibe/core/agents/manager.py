@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Final
 
 from vibe.core.agents.diagnostics import excluded_agent_message
@@ -11,7 +12,13 @@ from vibe.core.agents.models import (
     AgentType,
     BuiltinAgentName,
 )
-from vibe.core.agents.registry import AgentRegistry, apply_profile_overrides
+from vibe.core.agents.registry import (
+    AgentLoadFailure,
+    AgentRegistry,
+    apply_profile_overrides,
+    refuse_profile_shell_timeouts_over_the_users,
+)
+from vibe.core.config.builder import InvalidConfigError
 from vibe.core.config.harness_files import (
     HarnessFilesManager,
     get_harness_files_manager,
@@ -177,6 +184,10 @@ class AgentManager:
         return self._registry.discovered
 
     @property
+    def load_failures(self) -> tuple[AgentLoadFailure, ...]:
+        return self._registry.failures
+
+    @property
     def config(self) -> VibeConfigSchema:
         return self._orchestrator.config
 
@@ -230,12 +241,31 @@ class AgentManager:
             return name_matches(name, enabled)
         return not name_matches(name, self.config.disabled_agents)
 
+    def under(self, orchestrator: ConfigOrchestrator[VibeConfigSchema]) -> AgentManager:
+        """The same agents read against ``orchestrator``, a candidate config:
+        switching there touches neither this manager nor its config.
+        """
+        view = copy.copy(self)
+        view._orchestrator = orchestrator
+        view._forced_agents = set(self._forced_agents)
+        return view
+
     def switch_profile(self, name: str) -> None:
-        self.active_profile = self.get_agent(name)
-        self._install_profile(self.active_profile)
+        profile = self.get_agent(name)
+        # A refused profile leaves the session on the one it was running.
+        self._install_profile(profile)
+        self.active_profile = profile
 
     def _install_profile(self, profile: AgentProfile) -> None:
-        apply_profile_overrides(self._orchestrator, profile.overrides)
+        if profile.config_error is not None:
+            raise InvalidConfigError(
+                f"Agent '{profile.name}' in {profile.source_path}:"
+                f" {profile.config_error}"
+            )
+        refuse_profile_shell_timeouts_over_the_users(self._orchestrator, profile)
+        apply_profile_overrides(
+            self._orchestrator, profile.overrides, profile_name=profile.name
+        )
 
     def is_known_agent(self, name: str) -> bool:
         return name in self._discovered

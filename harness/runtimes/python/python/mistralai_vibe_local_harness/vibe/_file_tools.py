@@ -76,31 +76,27 @@ class WriteFileAnnotations(BaseModel):
     previous_content: str
 
 
-class SearchReplaceBlock(BaseModel):
-    old_str: str = Field(min_length=1)
-    new_str: str
+class EditArgs(BaseModel):
+    file_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    old_string: str = Field(min_length=1)
+    new_string: str
     replace_all: bool = False
 
 
-class SearchReplaceArgs(BaseModel):
-    file_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-    content: list[SearchReplaceBlock] = Field(min_length=1)
-
-
-class SearchReplaceResult(BaseModel):
+class EditResult(BaseModel):
     file: str
     lines_changed: int
     warnings: list[str] = Field(default_factory=list)
 
 
-class SearchReplacePreviewBlock(BaseModel):
+class EditPreviewBlock(BaseModel):
     old_start_line: int
     new_start_line: int
     old_lines: list[str]
     new_lines: list[str]
 
 
-class SearchReplaceAnnotations(BaseModel):
+class EditAnnotations(BaseModel):
     """Applied replacement previews and the text the edit replaced.
 
     ``previous_content`` is the file's whole pre-edit text, carried so readers
@@ -109,7 +105,7 @@ class SearchReplaceAnnotations(BaseModel):
     UTF-8 or was larger than the write annotation cap.
     """
 
-    blocks: list[SearchReplacePreviewBlock]
+    blocks: list[EditPreviewBlock]
     previous_content: str | None = None
 
 
@@ -132,13 +128,13 @@ class WriteFileResponse(BaseModel):
         return {WRITE_FILE_ANNOTATION_KEY: previous.model_dump(mode="json")}
 
 
-class SearchReplaceResponse(BaseModel):
-    result: SearchReplaceResult
-    annotations: list[SearchReplacePreviewBlock]
+class EditResponse(BaseModel):
+    result: EditResult
+    annotations: list[EditPreviewBlock]
     previous_content: str | None = None
 
     def meta(self) -> dict[str, JsonValue] | None:
-        previews = SearchReplaceAnnotations(
+        previews = EditAnnotations(
             blocks=self.annotations, previous_content=self.previous_content
         )
         return {SEARCH_REPLACE_ANNOTATION_KEY: previews.model_dump(mode="json")}
@@ -149,18 +145,14 @@ class FileTool:
     """How one file tool's arguments and helper response are read."""
 
     name: FileToolName
-    arguments: type[ReadFileArgs] | type[WriteFileArgs] | type[SearchReplaceArgs]
-    response: (
-        type[ReadFileResponse] | type[WriteFileResponse] | type[SearchReplaceResponse]
-    )
+    arguments: type[ReadFileArgs] | type[WriteFileArgs] | type[EditArgs]
+    response: type[ReadFileResponse] | type[WriteFileResponse] | type[EditResponse]
 
 
 FILE_TOOLS: Mapping[str, FileTool] = {
     "file_system.read_file": FileTool("read_file", ReadFileArgs, ReadFileResponse),
     "file_system.write_file": FileTool("write_file", WriteFileArgs, WriteFileResponse),
-    "file_system.search_replace": FileTool(
-        "search_replace", SearchReplaceArgs, SearchReplaceResponse
-    ),
+    "file_system.edit": FileTool("edit", EditArgs, EditResponse),
 }
 
 
@@ -218,14 +210,11 @@ async def _run_file_tool(
     authorized_path: Path | None,
 ) -> JsonValue:
     sandbox = config.sandbox
+    raw_path = arguments[_sandbox_helper.FILE_TOOL_PATH_KEYS[tool.name]]
     on_host = sandbox is None or (
         tool.name == "read_file"
         and _is_within(
-            authorized_path
-            or sandbox_path(
-                str(arguments[_sandbox_helper.FILE_TOOL_PATH_KEYS[tool.name]]),
-                cwd=config.workspace.cwd,
-            ),
+            authorized_path or sandbox_path(str(raw_path), cwd=config.workspace.cwd),
             additional_read_roots,
         )
     )
@@ -247,15 +236,56 @@ async def _run_file_tool(
             ),
         ),
     }
-    if on_host or sandbox is None:
-        return await asyncio.to_thread(_sandbox_helper.run_file_tool, request)
-    return await run_helper(
-        sandbox,
-        "file",
-        request,
-        timeout=SANDBOX_FILE_TOOL_TIMEOUT_SECONDS,
-        crashes=config.helper_crashes,
-    )
+    # The provider is asked for parallel tool calls, so two calls can target
+    # one file in the same turn. Both read the pre-edit text before either
+    # writes, and the atomic rename makes the loser's edit vanish without an
+    # error, so writes to one path are serialised. Reads share the lock too:
+    # one that interleaves a write returns either the whole before-state or
+    # the whole after-state, never a torn one.
+    async with _file_tool_lock(raw_path, config, authorized_path):
+        if on_host or sandbox is None:
+            return await asyncio.to_thread(_sandbox_helper.run_file_tool, request)
+        return await run_helper(
+            sandbox,
+            "file",
+            request,
+            timeout=SANDBOX_FILE_TOOL_TIMEOUT_SECONDS,
+            crashes=config.helper_crashes,
+        )
+
+
+_FILE_TOOL_LOCKS: dict[str, asyncio.Lock] = {}
+_FILE_TOOL_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _file_tool_lock(
+    raw_path: JsonValue, config: LocalRuntimeAdapterConfig, authorized: Path | None
+) -> asyncio.Lock:
+    # Locks belong to one event loop; a stale lock from another loop is never
+    # taken, so the table is rebuilt when the loop changes.
+    global _FILE_TOOL_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _FILE_TOOL_LOCK_LOOP is not loop:
+        _FILE_TOOL_LOCKS.clear()
+        _FILE_TOOL_LOCK_LOOP = loop
+    if authorized is not None:
+        key = str(authorized)
+    elif config.sandbox is None:
+        target = Path(str(raw_path)).expanduser()
+        if not target.is_absolute():
+            target = Path(config.workspace.cwd) / target
+        key = str(target.resolve())
+    else:
+        # This host's file system may not hold the path, or may link it
+        # elsewhere, so the key is the sandbox-normalized path as written,
+        # the same normalization the sandbox applies. A ``~`` path stays
+        # unexpanded because the sandbox's home is unknown here, so ``~/a``
+        # and its expanded spelling still take different locks.
+        key = str(sandbox_path(str(raw_path), cwd=config.workspace.cwd))
+    lock = _FILE_TOOL_LOCKS.get(key)
+    if lock is None:
+        lock = _FILE_TOOL_LOCKS[key] = asyncio.Lock()
+    return lock
 
 
 def _read_roots(
