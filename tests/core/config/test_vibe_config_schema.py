@@ -1391,7 +1391,7 @@ def test_peer_review_group_defaults_and_overrides() -> None:
     assert config.peer_review.max_tool_rounds == 4
     assert config.peer_review.auto_steer is False
     assert config.peer_review.auto_steer_severity == PeerSeverity.CRITICAL
-    assert config.peer_review.allow_web_tools is True
+    assert config.peer_review.allow_web_tools is False
     assert config.peer_review.timeout_seconds == 60.0
 
     tuned = VibeConfigSchema.model_validate({
@@ -1400,7 +1400,7 @@ def test_peer_review_group_defaults_and_overrides() -> None:
             "max_tool_rounds": 0,
             "auto_steer": True,
             "auto_steer_severity": "warning",
-            "allow_web_tools": False,
+            "allow_web_tools": True,
             "timeout_seconds": 90.0,
         }
     })
@@ -1409,7 +1409,7 @@ def test_peer_review_group_defaults_and_overrides() -> None:
     assert tuned.peer_review.max_tool_rounds == 0
     assert tuned.peer_review.auto_steer is True
     assert tuned.peer_review.auto_steer_severity == PeerSeverity.WARNING
-    assert tuned.peer_review.allow_web_tools is False
+    assert tuned.peer_review.allow_web_tools is True
     assert tuned.peer_review.timeout_seconds == 90.0
 
 

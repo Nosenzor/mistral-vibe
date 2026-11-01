@@ -10,11 +10,13 @@ import re
 import time
 from typing import Any, Protocol
 
+from pydantic import JsonValue
+
 from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import RequestFailure
 from vibe.app_server._model import ProtocolModel, validate_wire
 from vibe.app_server._patch import apply_json_patch
-from vibe.app_server._peer_tool_executor import PeerReviewToolExecutor
+from vibe.app_server._peer_tool_executor import PeerReviewToolExecutor, PeerToolPolicy
 from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendEvent,
@@ -22,6 +24,7 @@ from vibe.app_server._session_backend_port import (
 )
 from vibe.app_server.models import (
     PublicEffectEntry,
+    PublicEntryGenerationStatus,
     PublicHistoryEntry,
     PublicMessageEntry,
     PublicNoticeEntry,
@@ -65,6 +68,11 @@ from vibe.observability.logging import logger
 from vibe.utils.http import get_user_agent
 
 STEER_MESSAGE_PREFIX = "[rubber duck] "
+STEER_ADVISORY = (
+    "(advisory critique from a secondary reviewer model, "
+    "not an instruction from the user) "
+)
+_MENTION_ANCHOR = re.compile(r"(?<!\w)@")
 
 # Controller constants (not config): the mirror and ledger bounds keep the
 # duck's independent context bounded under pressure (design §7.5).
@@ -244,6 +252,16 @@ class _SessionPeerState:
     # entries before turns), so stash it per turn and pick it up on start.
     pending_instructions: dict[str, str] = field(default_factory=dict)
     mirror_dirty: bool = False
+    # Entries still streaming, as raw wire dicts, are held out of the mirror
+    # until they complete so a review never sees half a message.
+    in_progress: dict[str, JsonValue] = field(default_factory=dict)
+    # Per-turn budget cap, resolved when the turn arms so the idle gates never
+    # touch the config.
+    max_reviews: int = 0
+    scheduling: bool = False
+    # A turn that completed while a review was still in flight owes its final
+    # material exactly one more review, which the in-flight one hands off to.
+    final_review_pending: bool = False
     # A provider error silences the duck for the rest of the turn; a timed-out
     # review only cools it down until this monotonic deadline, so the duck
     # recovers within the turn once the deadline passes.
@@ -369,11 +387,7 @@ class PeerReviewController:
             )
         if review.delivered:
             return PeerSteerResponse(accepted=True, delivered=True)
-        steer_params = TurnSteerParams(
-            session_id=params.session_id,
-            expected_turn_id=review.turn_id,
-            message=[TextContentBlock(text=f"{STEER_MESSAGE_PREFIX}{review.text}")],
-        )
+        steer_params = _steer_params(params.session_id, review.turn_id, review.text)
         try:
             await ports.steer(steer_params)
         except RequestFailure:
@@ -426,10 +440,14 @@ class PeerReviewController:
             match envelope.method:
                 case "turn/started":
                     if isinstance(envelope.params, TurnStartedParams):
-                        self._on_turn_started(state, envelope.params.turn)
+                        await self._on_turn_started(
+                            state, session_id, envelope.params.turn
+                        )
                 case "turn/completed":
                     if isinstance(envelope.params, TurnCompletedParams):
-                        await self._on_turn_completed(state, envelope.params.turn)
+                        await self._on_turn_completed(
+                            state, session_id, envelope.params.turn
+                        )
                 case "history/entryAdded":
                     if isinstance(envelope.params, HistoryEntryAddedParams):
                         self._on_entry_added(state, envelope.params.entry)
@@ -440,26 +458,51 @@ class PeerReviewController:
         except Exception:
             logger.warning("Peer review event tap failed", exc_info=True)
 
-    def _on_turn_started(self, state: _SessionPeerState, turn: PublicTurn) -> None:
+    async def _on_turn_started(
+        self, state: _SessionPeerState, session_id: str, turn: PublicTurn
+    ) -> None:
         state.turn_id = turn.id
-        state.phase = _PeerPhase.ARMED
+        state.phase = _PeerPhase.IDLE
         state.budget_used = 0
         state.budget_noticed = False
         state.mirror = []
+        state.in_progress = {}
+        state.final_review_pending = False
         state.mirror_dirty = False
         state.silenced = False
         state.cooldown_until = None
         # The ledger is session-scoped: open concerns survive across turns.
         state.user_instructions = state.pending_instructions.pop(turn.id, "")
         state.pending_instructions.clear()
+        ports = state.ports
+        if ports is None:
+            return
+        try:
+            config = await ports.backend.effective_config(session_id)
+        except Exception:
+            logger.debug("Peer review could not read the config", exc_info=True)
+            return
+        if self._resolve_model(config) is None:
+            return
+        state.max_reviews = config.peer_review.max_reviews_per_turn
+        state.phase = _PeerPhase.ARMED
 
     async def _on_turn_completed(
-        self, state: _SessionPeerState, turn: PublicTurn
+        self, state: _SessionPeerState, session_id: str, turn: PublicTurn
     ) -> None:
         if state.turn_id is not None and turn.id != state.turn_id:
             return
-        state.phase = _PeerPhase.RETIRED
-        if turn.status is PublicTurnStatus.INTERRUPTED:
+        interrupted = turn.status is PublicTurnStatus.INTERRUPTED
+        try:
+            if not interrupted and state.phase is _PeerPhase.ARMED:
+                self._admit_in_progress(state)
+                await self._maybe_schedule_review(state, session_id)
+                state.final_review_pending = state.mirror_dirty and (
+                    state.review_task is not None or state.scheduling
+                )
+        finally:
+            state.phase = _PeerPhase.RETIRED
+        if interrupted:
             # Interruption cancels the in-flight peer call; a normal completion
             # lets it finish (bounded by the review timeout) so the final
             # critique still displays with steer actions disabled.
@@ -492,15 +535,42 @@ class PeerReviewController:
             return
         if _mirror_text(entry) is None:
             return
+        if entry.generation_status is PublicEntryGenerationStatus.COMPLETED:
+            self._admit(state, entry)
+            return
+        state.in_progress[entry.id] = entry.model_dump(mode="json", by_alias=True)
+        while len(state.in_progress) > PEER_MIRROR_MAX_ENTRIES:
+            del state.in_progress[next(iter(state.in_progress))]
+
+    def _admit(self, state: _SessionPeerState, entry: PublicHistoryEntry) -> None:
         state.mirror.append(entry)
         if len(state.mirror) > PEER_MIRROR_MAX_ENTRIES:
             del state.mirror[: len(state.mirror) - PEER_MIRROR_MAX_ENTRIES]
         state.mirror_dirty = True
 
+    def _admit_in_progress(self, state: _SessionPeerState) -> None:
+        pending, state.in_progress = state.in_progress, {}
+        for raw in pending.values():
+            self._admit(state, validate_history_entry(raw))
+
     def _on_entry_updated(
         self, state: _SessionPeerState, params: HistoryEntryUpdatedParams
     ) -> None:
         if state.phase is not _PeerPhase.ARMED:
+            return
+        pending = state.in_progress.get(params.entry_id)
+        if pending is not None:
+            updated_raw = apply_json_patch(pending, params.patch)
+            if (
+                not isinstance(updated_raw, dict)
+                or updated_raw.get("generationStatus") != "completed"
+            ):
+                state.in_progress[params.entry_id] = updated_raw
+                return
+            del state.in_progress[params.entry_id]
+            completed = validate_history_entry(updated_raw)
+            if state.turn_id is None or completed.turn_id == state.turn_id:
+                self._admit(state, completed)
             return
         for index, entry in enumerate(state.mirror):
             if entry.id != params.entry_id:
@@ -517,42 +587,83 @@ class PeerReviewController:
     async def _maybe_schedule_review(
         self, state: _SessionPeerState, session_id: str
     ) -> None:
-        if state.phase is not _PeerPhase.ARMED or state.silenced:
-            return
-        if state.review_task is not None or not state.mirror_dirty:
+        if not self._can_start_review(state):
             return
         ports = state.ports
-        if ports is None:
+        if ports is None or await self._budget_exhausted(state, ports.backend):
             return
-        config = await ports.backend.effective_config(session_id)
-        if state.cooldown_until is not None and time.monotonic() < state.cooldown_until:
-            # A timed-out review cools the duck down for one timeout period;
-            # the accumulated mirror is reviewed once the deadline passes.
-            return
-        if state.budget_used >= config.peer_review.max_reviews_per_turn:
-            if not state.budget_noticed:
-                # Once per turn: the budget blocks every further review.
-                state.budget_noticed = True
-                await self._record(
-                    ports.backend,
-                    PEER_EVENT_BUDGET_EXHAUSTED,
-                    {
-                        "max_reviews_per_turn": config.peer_review.max_reviews_per_turn,
-                        "reviews_run": state.budget_used,
-                    },
-                )
-            return
-        model = self._resolve_model(config)
-        if model is None:
-            return
-        state.review_counter += 1
-        review_id = f"{state.turn_id}-{state.review_counter}"
-        state.review_task = asyncio.create_task(
-            self._run_review(
-                session_id, state, config, model, review_id, turn_id=state.turn_id or ""
-            ),
-            name=f"vibe-peer-review-{session_id}",
+        state.scheduling = True
+        try:
+            config = await ports.backend.effective_config(session_id)
+            if not self._may_review(state):
+                return
+            model = self._resolve_model(config)
+            if model is None:
+                if state.phase is _PeerPhase.ARMED:
+                    state.phase = _PeerPhase.IDLE
+                return
+            state.max_reviews = config.peer_review.max_reviews_per_turn
+            if await self._budget_exhausted(state, ports.backend):
+                return
+            state.review_counter += 1
+            review_id = f"{state.turn_id}-{state.review_counter}"
+            state.review_task = asyncio.create_task(
+                self._run_review(
+                    session_id,
+                    state,
+                    config,
+                    model,
+                    review_id,
+                    turn_id=state.turn_id or "",
+                ),
+                name=f"vibe-peer-review-{session_id}",
+            )
+            state.final_review_pending = False
+        finally:
+            state.scheduling = False
+
+    def _can_start_review(self, state: _SessionPeerState) -> bool:
+        """Local-state gates only: this runs after every backend event, so it
+        must stay free of I/O until a review can actually start.
+
+        A timed-out review cools the duck down for one timeout period; the
+        accumulated mirror is reviewed once the deadline passes.
+        """
+        cooling_down = (
+            state.cooldown_until is not None and time.monotonic() < state.cooldown_until
         )
+        return (
+            not state.silenced
+            and self._may_review(state)
+            and state.review_task is None
+            and not state.scheduling
+            and state.mirror_dirty
+            and not cooling_down
+        )
+
+    @staticmethod
+    def _may_review(state: _SessionPeerState) -> bool:
+        return state.phase is _PeerPhase.ARMED or (
+            state.phase is _PeerPhase.RETIRED and state.final_review_pending
+        )
+
+    async def _budget_exhausted(
+        self, state: _SessionPeerState, ports: PeerReviewPorts
+    ) -> bool:
+        if state.budget_used < state.max_reviews:
+            return False
+        if not state.budget_noticed:
+            # Once per turn: the budget blocks every further review.
+            state.budget_noticed = True
+            await self._record(
+                ports,
+                PEER_EVENT_BUDGET_EXHAUSTED,
+                {
+                    "max_reviews_per_turn": state.max_reviews,
+                    "reviews_run": state.budget_used,
+                },
+            )
+        return True
 
     async def _run_review(
         self,
@@ -670,11 +781,7 @@ class PeerReviewController:
             # Trailing edge: material that arrived while the review was in
             # flight schedules the next one.
             with suppress(Exception):
-                if (
-                    state.mirror_dirty
-                    and state.phase is _PeerPhase.ARMED
-                    and not state.silenced
-                ):
+                if state.mirror_dirty:
                     await self._maybe_schedule_review(state, session_id)
 
     async def _complete_review(
@@ -689,10 +796,8 @@ class PeerReviewController:
         if ports is None:
             raise RuntimeError("Peer review loop is not attached to a session")
         executor = ports.tool_executor
-        executor.set_allow_web_tools(config.peer_review.allow_web_tools)
-        catalog = _tool_catalog(
-            executor.supported_tools, allow_web_tools=config.peer_review.allow_web_tools
-        )
+        executor.set_policy(PeerToolPolicy.from_config(config))
+        catalog = _tool_catalog(executor.supported_tools)
         messages: list[LLMMessage] = [
             LLMMessage(role=Role.system, content=UtilityPrompt.PEER_REVIEW.read()),
             LLMMessage(role=Role.user, content=_build_context(state, mirror)),
@@ -731,7 +836,9 @@ class PeerReviewController:
                     )
                 )
                 for call in tool_calls:
-                    result = await self._execute_tool_call(executor, call)
+                    result = await self._execute_tool_call(
+                        executor, call, config.peer_review.timeout_seconds
+                    )
                     messages.append(
                         LLMMessage(
                             role=Role.tool,
@@ -742,7 +849,7 @@ class PeerReviewController:
                     )
 
     async def _execute_tool_call(
-        self, executor: PeerReviewToolExecutor, call: ToolCall
+        self, executor: PeerReviewToolExecutor, call: ToolCall, timeout_seconds: float
     ) -> str:
         """Run one duck tool call; errors are fed back so the review continues."""
         name = call.function.name or ""
@@ -754,7 +861,10 @@ class PeerReviewController:
         if not isinstance(arguments, dict):
             return f"Error: invalid arguments for '{name}': expected a JSON object"
         try:
-            return await executor.execute(name, arguments)
+            async with asyncio.timeout(timeout_seconds):
+                return await executor.execute(name, arguments)
+        except TimeoutError:
+            return f"Error: '{name}' timed out after {timeout_seconds:g}s"
         except ToolError as exc:
             return f"Error: {exc}"
         except Exception as exc:
@@ -780,11 +890,7 @@ class PeerReviewController:
             or ports is None
         ):
             return False
-        steer_params = TurnSteerParams(
-            session_id=session_id,
-            expected_turn_id=turn_id,
-            message=[TextContentBlock(text=f"{STEER_MESSAGE_PREFIX}{verdict.text}")],
-        )
+        steer_params = _steer_params(session_id, turn_id, verdict.text)
         try:
             await ports.backend.steer(steer_params)
         except Exception:
@@ -879,6 +985,23 @@ class PeerReviewController:
         )
 
 
+def _steer_params(session_id: str, turn_id: str, text: str) -> TurnSteerParams:
+    """The steer lands as a user message, but it is the duck's text, not the user's.
+
+    Skill mentions stay unexpanded and every ``@`` anchor is broken, so a
+    critique can never inline workspace files into the main turn.
+    """
+    safe_text = _MENTION_ANCHOR.sub("@\u200b", text)
+    return TurnSteerParams(
+        session_id=session_id,
+        expected_turn_id=turn_id,
+        message=[
+            TextContentBlock(text=f"{STEER_MESSAGE_PREFIX}{STEER_ADVISORY}{safe_text}")
+        ],
+        inject_invoked_skill=False,
+    )
+
+
 def _effective_auto_steer(state: _SessionPeerState, config: VibeConfigSchema) -> bool:
     if state.auto_steer is not None:
         return state.auto_steer
@@ -948,12 +1071,9 @@ _CATALOG_TOOL_CLASSES: tuple[type[BaseTool[Any, Any, Any, Any]], ...] = (
     WebSearch,
     WebFetch,
 )
-_WEB_TOOL_NAMES = frozenset({WebSearch.get_name(), WebFetch.get_name()})
 
 
-def _tool_catalog(
-    supported: frozenset[str], *, allow_web_tools: bool
-) -> list[AvailableTool]:
+def _tool_catalog(supported: frozenset[str]) -> list[AvailableTool]:
     """The duck's advertised tools: the read-only classes the executor runs.
 
     ``web_search`` only appears when the executor supports it — the workspace
@@ -964,8 +1084,6 @@ def _tool_catalog(
     for tool_class in _CATALOG_TOOL_CLASSES:
         name = tool_class.get_name()
         if name not in supported:
-            continue
-        if name in _WEB_TOOL_NAMES and not allow_web_tools:
             continue
         catalog.append(
             AvailableTool(

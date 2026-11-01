@@ -320,13 +320,16 @@ peer = "local"
 # it and streams critiques into the peer panel (`Ctrl+P` toggles it); the panel
 # lists each critique with its severity, and a focused `Enter` steers the
 # selected critique into the running turn (`d` dismisses it). The duck gets a
-# read-only tool loop and never edits files.
+# read-only tool loop (`read_file`, and `grep` when ripgrep is on PATH) that
+# follows your [tools.*] permissions and enabled/disabled tool lists, and it
+# never edits files. The session transcript and anything the duck reads go to
+# the duck model's provider.
 [peer_review]
 max_reviews_per_turn = 10         # Review budget per turn; further reviews are skipped
 max_tool_rounds = 4               # Read-only tool rounds per review
 auto_steer = false                # Deliver critiques at or above auto_steer_severity automatically
 auto_steer_severity = "critical"  # Minimum severity auto-steer delivers: info | warning | critical
-allow_web_tools = true            # Let the duck call web_fetch while reviewing (web_search is not available to the duck yet)
+allow_web_tools = false           # Opt in: let the duck fetch public web pages without asking (web_search is not available to the duck yet)
 timeout_seconds = 60              # Per-call timeout; a timed-out review pauses the duck for one timeout period, then it retries within the turn
 ```
 

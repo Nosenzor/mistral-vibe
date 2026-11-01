@@ -273,7 +273,7 @@ class TestPeerReviewConfig:
         assert orch.config.peer_review.auto_steer is True
         # Shallow merge: keys the layer did not set keep their defaults.
         assert orch.config.peer_review.max_tool_rounds == 4
-        assert orch.config.peer_review.allow_web_tools is True
+        assert orch.config.peer_review.allow_web_tools is False
 
     @pytest.mark.asyncio
     async def test_session_override_resolves_the_peer_model(

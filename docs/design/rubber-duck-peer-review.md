@@ -105,11 +105,14 @@ Current adjacent behavior, source-confirmed:
   `turn/steer` RPC.
 - **Budget:** max reviews per turn (`peer_review.max_reviews_per_turn`,
   default 10).
-- **Read-only toolset:** the duck's fixed tool allowlist — `read_file`,
-  `grep`, `web_search`, `web_fetch` — executed against the session workspace.
-  Web tools are gated by `peer_review.allow_web_tools` (default `true`) and
-  their queries are shown in the panel. Write/edit/shell/subagent tools are
-  never in the allowlist.
+- **Read-only toolset:** the duck's allowlist — `read_file`, `grep`,
+  `web_fetch` (`web_search` is not available to the duck in v1) — executed
+  against the session workspace and filtered by the session's effective tool
+  config: a tool that is disabled (`disabled_tools`, `enabled_tools`), set to
+  `never`, or set to `ask` (the duck cannot prompt) is not offered. `grep`
+  runs ripgrep and is not offered when `rg` is not on PATH. `web_fetch` is
+  off unless `peer_review.allow_web_tools` is `true` (default `false`).
+  Write/edit/shell/subagent tools are never in the allowlist.
 - **Independent context:** the duck's own conversation context, constructed
   per review — never the main model's context window, system prompt, or
   compaction state. Built from: the critic system prompt, the user's original
@@ -269,12 +272,13 @@ Config (layered, ADR 0005):
   `max_tool_rounds` (int, default 4, ge 0 — 0 means the duck may not use
   tools), `auto_steer` (bool, default false), `auto_steer_severity`
   (`info` | `warning` | `critical`, default `critical`), `allow_web_tools`
-  (bool, default true — when false, `web_search`/`web_fetch` are removed from
-  the duck's allowlist).
+  (bool, default false — an explicit opt-in; when false, `web_fetch` is not
+  offered to the duck).
 
 Duck completion contract: the duck model receives the read-only tool catalog
-(`read_file`, `grep`, and — when `allow_web_tools` — `web_search`,
-`web_fetch`) and its **independent context**, constructed per review as: the
+(`read_file`, `grep`, and — when `allow_web_tools` — `web_fetch`; the catalog
+is filtered by the session's effective tool config) and its **independent
+context**, constructed per review as: the
 critic system prompt (`vibe/core/prompts/peer_review.md`), the user's original
 instructions for the turn, the transcript material new since the last review
 (bounded sliding window, text-only), and the concerns ledger. The main
@@ -300,9 +304,11 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   `turn/completed` with turn status `interrupted` (there is no separate
   `turn/interrupted` notification); the controller distinguishes the two by
   turn status. Retirement stops new reviews; an in-flight review is cancelled
-  when the turn ended by interruption, and allowed to finish (bounded by the
-  review timeout) when the turn completed normally, so the final critique
-  still displays with steer actions disabled.
+  when the turn ended by interruption, and allowed to finish when the turn
+  completed normally (each completion and each tool call is bounded by the
+  review timeout), so the final critique still displays with steer actions
+  disabled. A turn that completes while a review is in flight owes its final
+  material exactly one more review, which the in-flight review hands off to.
 - Coalescing: entries arriving while a review is in flight batch into the next
   review (trailing edge); at most one review in flight per session.
 - Tool rounds are serialized inside a review (one round at a time) and capped
@@ -327,14 +333,20 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   10`). The mirror covers root-session material only: when the main model
   runs `task`, the duck sees the tool call and result in the root transcript,
   not the child session's internal turns.
+- Entries are mirrored once their `generationStatus` is `completed`. Entries
+  still streaming are held aside and updated from their patches, so a review
+  never sees half a message or a tool that is still running; leftovers are
+  admitted when the turn completes normally.
 - The duck's context is independent of the main model's: the main model's
   compaction, context window size, and system prompt never affect it. The
   duck's own context is bounded — the mirror is a sliding window and the
   concerns ledger is count-capped (default 10); when full, the oldest closed
   concerns drop first, then the oldest open ones with a "superseded" note.
-- Enabling mid-session starts the mirror fresh; the duck reviews from that
-  point. Config reload re-resolves the peer model live; the enabled flag and
-  budget survive.
+- The controller resolves whether a duck is configured once, at
+  `turn/started`: with none it stays idle for the turn (no config reads, no
+  mirroring), and a duck enabled between turns reviews from the next turn on,
+  with a fresh mirror. Within a turn, each review re-reads the config, so a
+  reload re-resolves the peer model live; the enabled flag and budget survive.
 - Idempotency: `peer/configure` and `peer/steer` are safe to repeat;
   `peer/steer` on an already-delivered review is a no-op returning
   `delivered=true`.
@@ -380,23 +392,32 @@ Steer payload: a user-role message, text prefixed with a fixed marker
   provider; crossing providers sends session content to a second provider —
   the config warning for `peer` naming a different provider than the main
   model covers this, and the panel header always shows the duck's provider.
-  Duck web queries can contain session-derived search terms and go to the
-  configured search provider; `allow_web_tools=false` disables this, and every
-  query is shown in the panel.
-- **Security:** the duck receives a fixed read-only tool allowlist — no
-  write/edit/shell tools, no `task` (subagents), no credentials beyond its
-  provider's — so it cannot modify the workspace, execute commands, or
-  escalate permissions. File tools run against the session workspace; reads
-  that would trip `read_file`'s `sensitive_patterns` approval gate are
-  **denied** for the duck — there is no interactive approval path for a
-  background peer — so the duck's read visibility is the main model's minus
-  sensitive files. Auto-approving the ASK-gated web tools behind
-  `allow_web_tools` (default `true`) is a deliberate deviation from ADR
-  0004's rule that side effects honor declared permissions: the duck is
-  non-interactive, so ASK cannot be surfaced. The mitigations are the
-  read-only allowlist, per-query visibility in the panel, and the
-  `allow_web_tools` kill switch. Steer injection is a user-role message,
-  which the main model treats as untrusted input like any user message.
+  Duck web fetches can carry session-derived URLs to arbitrary public hosts;
+  they are off by default (`allow_web_tools = false`), and fetched URLs are not
+  shown in the panel in v1.
+- **Security:** the duck receives a read-only tool allowlist, filtered by the
+  session's effective tool config — no write/edit/shell tools, no `task`
+  (subagents), no credentials beyond its provider's — so it cannot modify the
+  workspace, execute commands, or escalate permissions. File tools run against
+  the session workspace and honor the configured `sensitive_patterns`,
+  `denylist` and grep exclude patterns; a read that would need approval is
+  **denied** for the duck, since a background peer has no interactive approval
+  path. `read_file` resolves symlinks and refuses anything outside the
+  workspace; `grep` runs ripgrep in a killable subprocess, which does not
+  follow symlinks and cannot stall the app server's event loop with a
+  pathological pattern; every tool call is bounded by `timeout_seconds`.
+  `web_fetch` is a deliberate deviation from ADR 0004's rule that side effects
+  honor declared permissions: the duck is non-interactive, so ASK cannot be
+  surfaced, and enabling `allow_web_tools` stands in for the approval. It is
+  off by default; a `never` permission or the disabled-tool lists still win;
+  every hop, redirects included, must resolve to a public address (checked in
+  the ASCII form the client connects with), and the body is streamed under a
+  byte cap and a total deadline. A DNS-rebinding window between the address
+  check and the connection remains, and a configured proxy resolves names
+  remotely, so the local check does not describe the address it reaches. A steer is the duck's
+  text delivered as a user-role message, which the main model treats as an
+  instruction, so it is labeled as an advisory critique, its `@` mentions are
+  neutralized so it cannot inline workspace files, and skill injection is off.
 
 ## 8. Implementation Plan
 

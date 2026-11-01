@@ -129,7 +129,7 @@ class PeerReviewConfig(BaseSettings):
     max_tool_rounds: int = Field(default=4, ge=0)
     auto_steer: bool = False
     auto_steer_severity: PeerSeverity = PeerSeverity.CRITICAL
-    allow_web_tools: bool = True
+    allow_web_tools: bool = False
     timeout_seconds: float = Field(default=60.0, gt=0, le=600)
 
 
