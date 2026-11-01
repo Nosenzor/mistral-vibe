@@ -16,8 +16,14 @@ mod app_server_crash;
 mod approval_keys;
 #[path = "units/argument_hint.rs"]
 mod argument_hint;
+#[path = "units/artifacts.rs"]
+mod artifacts;
 #[path = "units/banner.rs"]
 mod banner;
+#[path = "units/bottom_bar_model.rs"]
+mod bottom_bar_model;
+#[path = "units/bottom_bar_model_click.rs"]
+mod bottom_bar_model_click;
 #[path = "units/bottom_bar_overflow.rs"]
 mod bottom_bar_overflow;
 #[path = "units/bottom_bar_selection.rs"]
@@ -26,6 +32,8 @@ mod bottom_bar_selection;
 mod builtin_skill_commands;
 #[path = "units/callback_kinds.rs"]
 mod callback_kinds;
+#[path = "units/callback_routing.rs"]
+mod callback_routing;
 #[path = "units/caret_focus.rs"]
 mod caret_focus;
 #[path = "units/check_upgrade_flags.rs"]
@@ -88,6 +96,8 @@ mod effect_entry;
 mod effect_output;
 #[path = "units/external_editor.rs"]
 mod external_editor;
+#[path = "units/fence_copy.rs"]
+mod fence_copy;
 #[path = "units/file_index_metrics.rs"]
 mod file_index_metrics;
 #[path = "units/file_index_rescan_ignore.rs"]
@@ -106,12 +116,16 @@ mod frames_oversized;
 mod headless_cli_flags;
 #[path = "units/headless_logic.rs"]
 mod headless_logic;
+#[path = "units/headless_model.rs"]
+mod headless_model;
 #[path = "units/headless_prompt.rs"]
 mod headless_prompt;
 #[path = "units/headless_run.rs"]
 mod headless_run;
 #[path = "units/headless_startup.rs"]
 mod headless_startup;
+#[path = "units/headless_system_prompt.rs"]
+mod headless_system_prompt;
 #[path = "units/hints.rs"]
 mod hints;
 #[path = "units/history_loading.rs"]
@@ -212,6 +226,10 @@ mod older_history;
 mod onboarding_boot_pending;
 #[path = "units/onboarding_loop_guard.rs"]
 mod onboarding_loop_guard;
+#[path = "units/onboarding_pinned_console.rs"]
+mod onboarding_pinned_console;
+#[path = "units/onboarding_provider_choice.rs"]
+mod onboarding_provider_choice;
 #[path = "units/onboarding_screens.rs"]
 mod onboarding_screens;
 #[path = "units/onboarding_seed.rs"]
@@ -292,6 +310,10 @@ mod quit_confirmation;
 mod quit_manager_state;
 #[path = "units/reader_frame_split.rs"]
 mod reader_frame_split;
+#[path = "units/release_notes.rs"]
+mod release_notes;
+#[path = "units/release_notes_frame.rs"]
+mod release_notes_frame;
 #[path = "units/rename_usage.rs"]
 mod rename_usage;
 #[path = "units/replay_drained.rs"]
@@ -306,6 +328,8 @@ mod resume_lease_lock;
 mod resume_picker_delete;
 #[path = "units/resume_picker_exits.rs"]
 mod resume_picker_exits;
+#[path = "units/resume_picker_list.rs"]
+mod resume_picker_list;
 #[path = "units/resume_picker_outcomes.rs"]
 mod resume_picker_outcomes;
 #[path = "units/retry_presentation.rs"]
@@ -344,6 +368,8 @@ mod selection_lost_release;
 mod selection_prompt_marker;
 #[path = "units/selection_spans.rs"]
 mod selection_spans;
+#[path = "units/setup_entrypoint.rs"]
+mod setup_entrypoint;
 #[path = "units/setup_probe.rs"]
 mod setup_probe;
 #[path = "units/setup_welcome_gate.rs"]
@@ -352,6 +378,8 @@ mod setup_welcome_gate;
 mod setup_wire;
 #[path = "units/shell_submission.rs"]
 mod shell_submission;
+#[path = "units/skill.rs"]
+mod skill;
 #[path = "units/skill_mention_completion.rs"]
 mod skill_mention_completion;
 #[path = "units/slash_completion.rs"]
@@ -360,6 +388,8 @@ mod slash_completion;
 mod startup_resume_intent;
 #[path = "units/stress_command.rs"]
 mod stress_command;
+#[path = "units/system_proxy.rs"]
+mod system_proxy;
 
 #[path = "units/subagent_click.rs"]
 mod subagent_click;
@@ -371,6 +401,8 @@ mod subagent_sessions;
 mod subagent_transcript;
 #[path = "units/subagent_view_keys.rs"]
 mod subagent_view_keys;
+#[path = "units/support.rs"]
+mod support;
 #[path = "units/telemetry_events.rs"]
 mod telemetry_events;
 #[path = "units/teleport_input.rs"]
@@ -385,6 +417,8 @@ mod teleport_support;
 mod terminal_detect;
 #[path = "units/terminal_input_filter.rs"]
 mod terminal_input_filter;
+#[path = "units/terminal_key.rs"]
+mod terminal_key;
 #[path = "units/terminal_read.rs"]
 mod terminal_read;
 #[path = "units/theme_detection.rs"]
@@ -415,6 +449,8 @@ mod tts_request;
 mod turn_counter;
 #[path = "units/turn_error_message.rs"]
 mod turn_error_message;
+#[path = "units/ui_event.rs"]
+mod ui_event;
 #[path = "units/unsolicited_turn.rs"]
 mod unsolicited_turn;
 #[path = "units/update_brew_oracle.rs"]
@@ -446,5 +482,7 @@ mod voice_settings;
 mod voice_text;
 #[path = "units/voice_tracking.rs"]
 mod voice_tracking;
+#[path = "units/whats_new.rs"]
+mod whats_new;
 #[path = "units/whoami.rs"]
 mod whoami;

@@ -46,6 +46,7 @@ from mistralai_vibe_local_harness.vibe._errors import (
     HarnessCallbackConflictError,
     HarnessCallbackNotFoundError,
     HarnessCommandConflictError,
+    HarnessConfigurationRejectedError,
     HarnessContextCompactionError,
     HarnessForkActiveTurnError,
     HarnessForkEntryNotFoundError,
@@ -66,6 +67,10 @@ from mistralai_vibe_local_harness.vibe._errors import (
     HarnessTurnQueueIdempotencyConflictError,
     HarnessTurnQueuePendingError,
     HarnessUnfinishedMigrationError,
+)
+from mistralai_vibe_local_harness.vibe._foreign_hooks import (
+    HookProcess,
+    HookProcessResolver,
 )
 from mistralai_vibe_local_harness.vibe._hook_config import (
     CompiledHooks,
@@ -91,6 +96,7 @@ from mistralai_vibe_local_harness.vibe._local_actions import (
     CLASSIFICATION_EVENT_TYPE,
     AcceptOrRetryPostAgentHandler,
     ApprovalGrant,
+    HookAgentIdentity,
     HookApprovalCallback,
     HookContext,
     HookHandlers,
@@ -116,7 +122,15 @@ from mistralai_vibe_local_harness.vibe._mcp_models import (
     ResolvedMCPCatalog,
     ResolvedMCPServerConfig,
 )
+from mistralai_vibe_local_harness.vibe._mcp_runtime import MCPDiscoveryFlights
 from mistralai_vibe_local_harness.vibe._protected_paths import protected_target
+from mistralai_vibe_local_harness.vibe._route_profile import (
+    adapter_capabilities,
+    compile_route_profile,
+    default_model_facts,
+    rust_input_modalities,
+    rust_model_facts,
+)
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalProviderRoute,
@@ -145,6 +159,7 @@ from mistralai_vibe_local_harness.vibe._session import (
     HarnessSessionSubscription,
     UnifiedHarnessSessionBackend,
 )
+from mistralai_vibe_local_harness.vibe._shell_tools import BASH_TIMEOUT, bash_timeout
 from mistralai_vibe_local_harness.vibe._smart_approve import (
     DEFAULT_SMART_APPROVE_MODEL,
     ClassificationTier,
@@ -160,9 +175,16 @@ from mistralai_vibe_local_harness.vibe._smart_approve import (
 )
 from mistralai_vibe_local_harness.vibe._system_instructions import (
     build_vibe_code_system_instructions,
+    with_shell_guidance,
+)
+from mistralai_vibe_local_harness.vibe._utility_completion import (
+    UtilityCompletionError,
+    UtilityReply,
+    execute_utility_completion,
 )
 
 __all__ = [
+    "BASH_TIMEOUT",
     "CLASSIFICATION_EVENT_TYPE",
     "DEFAULT_SMART_APPROVE_MODEL",
     "INVALID_API_KEY_MESSAGE",
@@ -193,6 +215,7 @@ __all__ = [
     "HarnessCallbackConflictError",
     "HarnessCallbackNotFoundError",
     "HarnessCommandConflictError",
+    "HarnessConfigurationRejectedError",
     "HarnessContextCompactionError",
     "HarnessForkActiveTurnError",
     "HarnessForkEntryNotFoundError",
@@ -220,9 +243,12 @@ __all__ = [
     "HarnessTurnQueuePendingError",
     "HarnessUnfinishedMigrationError",
     "HelperCrashCount",
+    "HookAgentIdentity",
     "HookApprovalCallback",
     "HookContext",
     "HookHandlers",
+    "HookProcess",
+    "HookProcessResolver",
     "LegacyImportSource",
     "LegacySessionReference",
     "LegacySourceLoader",
@@ -236,6 +262,7 @@ __all__ = [
     "MCPAuthorizationRequired",
     "MCPAuthorizationSnapshot",
     "MCPDescriptorCachePolicy",
+    "MCPDiscoveryFlights",
     "MCPHTTPTransportPolicy",
     "MCPRouteSnapshot",
     "MCPSourceState",
@@ -283,15 +310,25 @@ __all__ = [
     "TurnStartRequest",
     "UnifiedHarnessSessionBackend",
     "UnifiedHarnessSessionBackendHost",
+    "UtilityCompletionError",
+    "UtilityReply",
+    "adapter_capabilities",
+    "bash_timeout",
     "build_classification_request",
     "build_vibe_code_system_instructions",
     "classify_tool_call",
     "compile_foreign_hooks",
+    "compile_route_profile",
     "create_harness_host",
+    "default_model_facts",
     "default_tool_risk_classifier",
+    "execute_utility_completion",
     "invalid_api_key_message",
     "protected_target",
     "run_helper",
+    "rust_input_modalities",
+    "rust_model_facts",
     "sandbox_path",
     "tool_catalog_for_config",
+    "with_shell_guidance",
 ]

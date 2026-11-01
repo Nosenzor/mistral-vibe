@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn rejects_new_turn_when_pre_agent_or_pre_llm_hook_is_pending() {
+    for point in ["pre_agent_turn", "pre_llm_call"] {
+        let turn_id = "turn-hook-busy";
+        let mut config = config();
+        config.capabilities.hook_bindings = serde_json::from_value(json!([{
+            "id": "pending-hook",
+            "point": point,
+            "order": 0,
+            "selector": {"type": "always"},
+        }]))
+        .unwrap();
+        let mut runtime = SynchronousRuntime::new(config);
+        let input = if point == "pre_agent_turn" {
+            json!({"user_content": [{"type": "text", "text": "first request"}]})
+        } else {
+            Value::Null
+        };
+        let mut expected = running(turn_id).dispatch(hook_call(point, &["pending-hook"], input));
+
+        if point == "pre_llm_call" {
+            expected = expected.observe(turn_started(turn_id, "first request"));
+        }
+        let hook = runtime
+            .apply(user_message(turn_id, "first request", "queue"), expected)
+            .only_action();
+
+        runtime.reject(
+            user_message("turn-follow-up", "next request", "queue"),
+            json!({
+                "code": "invalid_state",
+                "command_type": "user_message",
+                "state": "running",
+            }),
+        );
+
+        let mut output = json!({"type": "continue"});
+        let mut expected = running(turn_id).dispatch(llm_call(0));
+
+        if point == "pre_agent_turn" {
+            output["user_content"] = json!([{"type": "text", "text": "first request"}]);
+            expected = expected.observe(turn_started(turn_id, "first request"));
+        }
+        let completion = runtime
+            .apply(hook_completed(&hook, point, output), expected)
+            .only_action();
+
+        runtime.assert_last_model_message_update(
+            &completion,
+            "replace",
+            &[model_system(), model_user_text("first request")],
+        );
+        runtime.finish_turn_with_text(turn_id, &completion, "first answer");
+    }
+}
+
 ///
 /// *Prepare*: One session configures pre-agent, pre-LLM, post-LLM, pre-tool, post-tool, and post-agent hooks.
 /// *Do*: Drive a tool-using turn through every hook and a final model completion.
@@ -244,6 +300,88 @@ fn all_hook_points_execute_in_one_tool_using_turn() {
         ]
     );
     assert_eq!(tool_action["call"]["arguments"]["path"], "effective.txt");
+}
+
+///
+/// *Prepare*: One session binds a post-LLM hook and a post-agent hook.
+/// *Do*: Complete the model call with every provider token counter, then accept the candidate at each hook.
+/// *Assert*: Both hooks and the committed message receive every token counter unchanged.
+///
+#[test]
+fn completion_hooks_receive_every_token_counter() {
+    // Prepare
+    let turn_id = "turn-hook-usage";
+    let mut config = config();
+    config.capabilities.hook_bindings = serde_json::from_value(json!([
+        {"id": "usage-post-llm", "point": "post_llm_call", "order": 0, "selector": {"type": "always"}},
+        {"id": "usage-post-agent", "point": "post_agent_turn", "order": 1, "selector": {"type": "always"}}
+    ]))
+    .expect("completion hook bindings configure");
+    let mut runtime = SynchronousRuntime::new(config);
+    let completion = runtime.start_turn(turn_id, "count my tokens");
+    let usage = json!({
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+        "cached_input_tokens": 80,
+        "cache_write_tokens": 25,
+        "reasoning_tokens": 12,
+    });
+    let mut candidate = text_candidate("counted");
+    candidate["usage"] = usage.clone();
+    let mut model_result = text_completion(&completion, "counted");
+    model_result["result"]["usage"] = usage;
+
+    // Do
+    let post_llm = runtime
+        .apply(
+            model_result,
+            running(turn_id).dispatch(hook_call(
+                "post_llm_call",
+                &["usage-post-llm"],
+                json!({"candidate": candidate}),
+            )),
+        )
+        .only_action();
+    let post_agent = runtime
+        .apply(
+            hook_completed(
+                &post_llm,
+                "post_llm_call",
+                json!({"type": "accept", "acceptance": {"type": "candidate"}}),
+            ),
+            running(turn_id).dispatch(hook_call(
+                "post_agent_turn",
+                &["usage-post-agent"],
+                json!({"candidate": candidate}),
+            )),
+        )
+        .only_action();
+    runtime.apply(
+        hook_completed(
+            &post_agent,
+            "post_agent_turn",
+            json!({"type": "accept", "acceptance": {"type": "candidate"}}),
+        ),
+        completed(turn_id, vec![json!({"type": "text", "text": "counted"})])
+            .observe(json!({
+                "type": "assistant_message_committed",
+                "turn_id": turn_id,
+                "action_id": action_id(&completion),
+                "candidate": candidate,
+            }))
+            .observe(turn_completed(turn_id, "counted")),
+    );
+
+    // Assert
+    assert_eq!(
+        post_llm["input"]["candidate"]["usage"]["cache_write_tokens"],
+        25
+    );
+    assert_eq!(
+        post_agent["input"]["candidate"]["usage"]["reasoning_tokens"],
+        12
+    );
 }
 
 ///

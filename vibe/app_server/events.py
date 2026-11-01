@@ -21,6 +21,8 @@ from vibe.app_server.models import (
     validate_history_entry,
 )
 from vibe.app_server.protocol import (
+    ArtifactCreatedParams,
+    ArtifactUpdatedParams,
     ChildSessionUpdatedParams,
     ConnectorAuthRequiredParams,
     HistoryEntryAddedParams,
@@ -28,6 +30,7 @@ from vibe.app_server.protocol import (
     MCPAuthRequiredParams,
     Notification,
     PeerReviewParams,
+    PublicSessionArtifact,
     ServerErrorParams,
     ServerWarningParams,
     SessionCompactedParams,
@@ -133,6 +136,20 @@ class ConnectorAuthorizationRequiredEvent:
     action: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactCreated:
+    """A session artifact (PR/MR) was detected and recorded."""
+
+    artifact: PublicSessionArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactUpdated:
+    """A session artifact changed (Phase 3+: markViewed, provider sync)."""
+
+    artifact: PublicSessionArtifact
+
+
 type AppServerEvent = (
     HistoryEntryAdded
     | HistoryEntryUpdated
@@ -151,6 +168,8 @@ type AppServerEvent = (
     | ServerError
     | MCPAuthorizationRequiredEvent
     | ConnectorAuthorizationRequiredEvent
+    | ArtifactCreated
+    | ArtifactUpdated
 )
 
 _STREAMING_TEXT_PATHS = {"/content/0/text", "/text", "/state/outputText"}
@@ -260,6 +279,8 @@ type _KnownEventParams = (
     | TurnCompletedParams
     | TurnQueueUpdatedParams
     | TurnStartedParams
+    | ArtifactCreatedParams
+    | ArtifactUpdatedParams
 )
 
 
@@ -448,6 +469,12 @@ class ClientProjection:
             case PeerReviewParams():
                 # Transient panel notification; carries no session state.
                 event = None
+            case ArtifactCreatedParams():
+                # Artifacts live outside the projected session state; the
+                # notification is forwarded as-is.
+                event = ArtifactCreated(params.artifact)
+            case ArtifactUpdatedParams():
+                event = ArtifactUpdated(params.artifact)
             case SessionCompactedParams() | SessionContextClearedParams():
                 raise AssertionError("Session handoffs are reduced before events")
         return event
@@ -668,6 +695,10 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
             params = validate_wire(ChildSessionUpdatedParams, notification.params)
         case "peer/review":
             params = validate_wire(PeerReviewParams, notification.params)
+        case "artifacts/created":
+            params = validate_wire(ArtifactCreatedParams, notification.params)
+        case "artifacts/updated":
+            params = validate_wire(ArtifactUpdatedParams, notification.params)
         case _:
             raise UnknownNotificationError(
                 f"Unknown app-server notification: {notification.method}"

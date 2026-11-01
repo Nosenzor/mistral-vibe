@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Self
 
@@ -48,6 +48,14 @@ class ConfigSchema(BaseModel):
         also adjust an entry another layer defines.
         """
         return True
+
+    def check_layer_keys(self, layers: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
+        """Look at each layer's raw keys once the merged config is valid.
+
+        The merge reads only declared keys; a schema overrides this to say
+        what it makes of the rest. ``layers`` are (layer name, raw data) pairs
+        in stack order.
+        """
 
     @classmethod
     def validate_merged(

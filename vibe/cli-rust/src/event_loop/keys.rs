@@ -195,10 +195,12 @@ fn handle_input_event(
                 | Focus::ThemePicker
                 | Focus::ModelPicker
                 | Focus::LogLevelPicker
-                | Focus::ThinkingPicker => {}
+                | Focus::ThinkingPicker
+                | Focus::ArtifactsModal => {}
                 Focus::Question => crate::question_input::handle_paste(app, text),
                 Focus::ProxySetup => crate::proxy_setup::paste(app, &text),
                 Focus::Config => config::handle_paste(app, text),
+                Focus::ReleaseNotes => crate::release_notes::paste(app, &text),
                 Focus::VibeCodeProject => crate::vibe_code_project::input::paste(app, &text),
                 Focus::Mcp => crate::mcp::search::paste(app, &text),
                 Focus::Plugins => crate::plugins::paste(app, &text),
@@ -258,6 +260,7 @@ fn dispatch_key(
         Focus::Approval => crate::approval::handle_key(app, client, key),
         Focus::Question => crate::question_input::handle_key(app, client, key),
         Focus::Config => config::handle_key(app, client, config_tx, key),
+        Focus::ReleaseNotes => crate::release_notes::handle_key(app, key),
         Focus::VoiceApp => crate::voice_app::handle_key(app, client, key),
         Focus::ProxySetup => crate::proxy_setup::handle_key(app, client, key),
         Focus::VibeCodeProject => crate::vibe_code_project::input::handle_key(app, client, key),
@@ -271,6 +274,7 @@ fn dispatch_key(
         Focus::ModelPicker => input::handle_model_key(app, client, key),
         Focus::LogLevelPicker => input::handle_log_level_key(app, client, key),
         Focus::ThinkingPicker => input::handle_thinking_key(app, client, key),
+        Focus::ArtifactsModal => input::handle_artifacts_modal_key(app, key),
         // Esc cancels a project request in flight before the composer sees it.
         Focus::SubagentList | Focus::Composer if esc && app.vibe_code_project.pending => {
             crate::vibe_code_project::input::handle_key(app, client, key)

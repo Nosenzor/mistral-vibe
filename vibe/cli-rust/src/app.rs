@@ -72,7 +72,7 @@ pub enum Surface {
     /// A selectable rendered region, identified independently from its mouse target.
     Region(RegionId),
     Composer,
-    /// The bottom bar (working directory + PID), a single selectable row.
+    /// The bottom bar (working directory, model and token budget), a single selectable row.
     BottomBar,
 }
 
@@ -211,7 +211,10 @@ pub struct Session {
     pub prepared_worktree: Option<crate::worktree::WorktreeInfo>,
     /// Context budget `(current_tokens, max_tokens)`; `(_, 0)` renders as empty.
     pub tokens: (u64, u64),
-    pub stats: AgentStats,
+    /// The session's PR/MR artifacts, latest first; the footer shows the
+    /// latest as a link, or a modal listing them all when there are several.
+    pub artifacts: Vec<crate::server::PublicSessionArtifact>,
+    pub stats: crate::server::SessionStats,
     pub startup_config: StartupConfig,
     pub startup_error: Option<String>,
     /// The `--continue`/`--resume` intent, consumed once after `ready`.
@@ -242,28 +245,13 @@ pub struct Session {
     pub retry_continuation: Option<crate::commands::retry::RetryContinuation>,
     /// Silent incomplete_stream continuations spent.
     pub incomplete_stream_retries: u32,
-    /// The mounted custom-tools deprecation entry's id, so it shows once.
-    pub custom_tools_deprecation_id: Option<String>,
     /// The mounted what's-new entry, dropped on the first submit.
     pub whats_new: Option<crate::startup::banners::WhatsNew>,
     /// Token usage snapshot at attach; the exit summary reports the delta
     /// against it.
     pub usage_baseline: Option<crate::server::TokenUsage>,
-    /// The latest `runtime` value, so a transcript rebuild can re-run the
-    /// checks that read it (the rebuild re-shows the deprecation).
+    /// The latest `runtime` value, for views that read it after the event.
     pub runtime: Value,
-}
-
-/// Runtime token and cost totals rendered by `/status`.
-#[derive(Default)]
-pub struct AgentStats {
-    pub steps: u64,
-    pub session_prompt_tokens: u64,
-    pub session_completion_tokens: u64,
-    pub session_cached_tokens: u64,
-    pub last_turn_total_tokens: u64,
-    pub last_turn_cached_tokens: u64,
-    pub session_cost: f64,
 }
 
 /// Transcript rendering state: content, scroll, per-entry caches, and chrome.
@@ -303,6 +291,8 @@ pub struct View {
     /// Text rectangle of each toast painted last frame, keyed by toast id and
     /// ordered newest last. Bounded by the stack the rack fits on screen.
     pub toast_text_areas: Vec<(u64, Rect)>,
+    /// The active model's name in the bottom bar painted last frame, which a click opens `/model` on.
+    pub footer_model_area: Rect,
     /// The toast text region a selection is anchored in, or the default region
     /// while no toast owns one.
     pub toast_selection_region: Region,
@@ -318,6 +308,8 @@ pub struct View {
     pub bottom_app_selection_folds: crate::selection::Folds,
     /// The bottom app drawn last frame and its box rect, which own the box selection.
     pub bottom_app: Option<(crate::ui::bottom_app::Kind, Rect)>,
+    /// The PR/MR link painted in the bottom bar last frame, for click routing.
+    pub bottom_bar_link: Option<ui::bottom_bar::BarLink>,
     /// Wrapped rows of each toast painted last frame, keyed by toast id.
     pub toast_folds: Vec<(u64, crate::selection::Folds)>,
     /// Inclusive `(y, x0, x1)` cells inside the region that belong to no widget,
@@ -385,12 +377,14 @@ impl Default for View {
             pointer_shape: crate::pointer::Shape::default(),
             selection_region: Region::default(),
             toast_text_areas: Vec::new(),
+            footer_model_area: Rect::default(),
             toast_selection_region: Region::default(),
             loading_selection_region: Region::default(),
             bottom_app_selection_region: Region::default(),
             bottom_app_selection_chrome: Vec::new(),
             bottom_app_selection_folds: crate::selection::Folds::default(),
             bottom_app: None,
+            bottom_bar_link: None,
             toast_folds: Vec::new(),
             selection_chrome: Vec::new(),
             selection_hangs: Vec::new(),
@@ -432,8 +426,8 @@ pub struct Overlays {
 /// Shared `/` and `@` completion popup state.
 #[derive(Default)]
 pub struct Completion {
-    /// User-invocable skills `(name, description)`, shown as `/name` popup rows.
-    pub skills: Vec<(String, String)>,
+    /// User-invocable skills, shown as `/name` popup rows.
+    pub skills: Vec<crate::skill::Skill>,
     /// Files below `cwd`, maintained by a background watcher.
     pub files: FileIndex,
     /// Entries currently displayed by the shared `/` and `@` popup.
@@ -501,9 +495,6 @@ pub struct ThemePicker {
     pub original: usize,
     /// Deadline of the pending debounced preview.
     pub preview_at: Option<Instant>,
-    /// Sender carrying the theme returned by a `config/write` response, so the
-    /// commit re-applies the server's config.
-    pub tx: Option<Sender<crate::theme_picker::Event>>,
 }
 
 /// Agent modes: the runtime snapshot plus the Shift+Tab switch in flight.
@@ -519,6 +510,9 @@ pub struct Agents {
     /// Name the last Shift+Tab asked for, painted before the server answers
     /// and re-used as the base of a coalesced press.
     pub desired: Option<String>,
+    /// The last target the server refused; the next Shift+Tab cycles from it
+    /// so a broken profile does not trap the cycle.
+    pub refused: Option<String>,
     /// Whether a `session/agent/update` is in flight.
     pub switch_active: bool,
     /// Whether `/leanstall` or `/unleanstall` is in flight; input is rejected until it finishes.
@@ -529,8 +523,6 @@ pub struct Agents {
     pub switching_indicator: bool,
     /// Spinner frame, advanced on the shared 100 ms tick.
     pub frame: usize,
-    /// Sender carrying `session/agent/update` answers to the main thread.
-    pub tx: Option<Sender<crate::agents::Event>>,
 }
 
 /// A selectable model: `alias` is persisted, `display_name` is shown.
@@ -560,9 +552,15 @@ pub struct ModelPicker {
     pub default_display_name: String,
     /// Alias the Default row resolves to (`defaultModelAlias`).
     pub default_alias: String,
-    /// Sender carrying the `config/write` and `config/reload` answers, so the
-    /// commit re-applies the server's config.
-    pub tx: Option<Sender<crate::model_picker::Event>>,
+}
+
+/// The artifacts modal state (a bottom-app): the session's PR/MR links.
+#[derive(Default)]
+pub struct ArtifactsModal {
+    /// While set the modal replaces the input box: title, link rows, hint.
+    pub open: bool,
+    /// Highlighted artifact (latest first) and the viewport.
+    pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
 }
 
 /// `/log-level` picker state (a bottom-app).
@@ -582,8 +580,6 @@ pub struct LogLevelPicker {
     pub badges: Vec<(Rect, &'static str)>,
     /// The chain as it stood when the picker opened, for the diff on apply.
     pub chain: crate::observability::level::LogLevelChain,
-    /// Sender carrying the `config/write` answer.
-    pub tx: Option<Sender<crate::log_level_picker::Event>>,
 }
 
 /// `/thinking` picker state (a bottom-app).
@@ -598,8 +594,6 @@ pub struct ThinkingPicker {
     pub levels: Vec<String>,
     /// A `/model` pick held until its chained thinking level is chosen or skipped.
     pub model_pick: Option<crate::thinking_picker::ModelPick>,
-    /// Sender carrying the `config/write` and `config/reload` answers.
-    pub tx: Option<Sender<crate::thinking_picker::Event>>,
 }
 
 /// `/resume` picker state.
@@ -630,7 +624,6 @@ pub struct ResumePicker {
     /// Whether the lease watch subscription already fired this process.
     pub subscribed: bool,
     pub transcript: Option<crate::transcript::Snapshot>,
-    pub tx: Option<Sender<crate::resume_picker::Event>>,
 }
 
 /// Rewind bottom-app state, including whether rewind mode is on.
@@ -650,8 +643,6 @@ pub struct Rewind {
     pub restore_files: bool,
     /// Highlighted option in the current step.
     pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
-    /// Sender carrying server answers, applied on the main thread.
-    pub tx: Option<Sender<crate::rewind::Event>>,
 }
 
 /// `ask_user_question` bottom-app state.
@@ -659,9 +650,9 @@ pub struct Rewind {
 pub struct QuestionApp {
     /// While set the app replaces the input box and owns every key.
     pub open: bool,
-    /// A delivered question still waiting for a pause in the user's typing,
-    /// as `(source, request)`.
-    pub pending: Option<(crate::question_app::QuestionSource, UserQuestionRequest)>,
+    /// Delivered questions waiting for the open one to close or for a pause in
+    /// the user's typing, oldest first, as `(source, request)`.
+    pub pending: VecDeque<(crate::question_app::QuestionSource, UserQuestionRequest)>,
     /// Who the open app answers: a `user_input` callback or a local question.
     pub source: Option<crate::question_app::QuestionSource>,
     pub questions: Vec<UserQuestion>,
@@ -705,8 +696,6 @@ pub struct MCPApp {
     pub viewing_kind: Option<crate::server::MCPSourceKind>,
     /// Highlighted row index; headers and notes are skipped when navigating.
     pub list: crate::option_list::OptionList<crate::option_list::MultiAction>,
-    /// Sender carrying server answers, applied on the main thread.
-    pub tx: Option<Sender<crate::mcp::Event>>,
     /// The connector whose `connector_catalog/connect` is in flight, if any.
     pub connecting: Option<String>,
 }
@@ -758,8 +747,6 @@ pub struct MCPOAuthApp {
     pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Login attempt counter, so a stale answer cannot settle a retry.
     pub generation: u64,
-    /// Sender carrying the `mcp/login` answer, applied on the main thread.
-    pub tx: Option<Sender<crate::mcp_oauth::Event>>,
 }
 
 /// Connector auth bottom-app state.
@@ -781,12 +768,11 @@ pub struct ConnectorAuthApp {
     pub list: crate::option_list::OptionList<crate::option_list::SingleAction>,
     /// Open-attempt counter, so a stale worker answer cannot land.
     pub generation: u64,
-    /// Sender carrying the auth-read and refresh answers, applied on the main thread.
-    pub tx: Option<Sender<crate::connector_auth::Event>>,
 }
 
 #[derive(Default)]
 pub struct App {
+    pub credential_client: Option<Arc<crate::server::Client>>,
     pub terminal_notifier: crate::terminal_notifier::TerminalNotifier,
     pub chat_input: ChatInput,
     pub session: Session,
@@ -800,10 +786,12 @@ pub struct App {
     pub voice_app: crate::voice_app::VoiceApp,
     pub proxy_setup: crate::proxy_setup::ProxySetupApp,
     pub config_screen: ConfigScreen,
+    pub release_notes: crate::release_notes::State,
     pub theme_picker: ThemePicker,
     pub model_picker: ModelPicker,
     pub log_level_picker: LogLevelPicker,
     pub thinking_picker: ThinkingPicker,
+    pub artifacts_modal: ArtifactsModal,
     pub resume_picker: ResumePicker,
     pub vibe_code_project: crate::vibe_code_project::State,
     /// The running `/teleport` operation, if any.
@@ -828,6 +816,8 @@ pub struct App {
     pub queue: QueueController,
     /// Ctrl+C / Ctrl+D double-press quit confirmation.
     pub quit: crate::quit_manager::QuitManager,
+    /// Widget answers to async requests, applied by the main event loop.
+    pub events: Option<crate::ui_event::Sender>,
     /// Async slash-command results, reduced by the main event loop.
     pub command_tx: Option<tokio::sync::mpsc::Sender<CommandEvent>>,
     /// Analytics events queued by the reducer, sent by the main event loop.
@@ -978,16 +968,20 @@ impl App {
         }
     }
 
-    /// Show the hint-free `Loading` spinner while a slash command fetches.
-    pub fn begin_command_loading(&mut self) {
-        if self.session.shell_operation_id.is_some() {
-            return;
+    /// Show the hint-free `Loading` spinner while a slash command fetches; false when another job owns it.
+    pub fn begin_command_loading(&mut self) -> bool {
+        // A running shell command or turn keeps its own loading line.
+        if self.session.shell_operation_id.is_some()
+            || matches!(self.session.status, Status::Generating { .. })
+        {
+            return false;
         }
         self.view.loading = LoadingAnim::default();
         self.view
             .loading
             .set_label(ui::loading::COMMAND_LOADING_STATUS);
         self.view.command_loading = true;
+        true
     }
 
     /// Render the whole UI; layout and per-region drawing live in `ui`.
@@ -1089,7 +1083,12 @@ impl App {
         else {
             return;
         };
-        match crate::voice::start(&cfg, self.voice.peak.clone(), tx) {
+        match crate::voice::start(
+            &cfg,
+            self.credential_client.clone(),
+            self.voice.peak.clone(),
+            tx,
+        ) {
             Ok(rec) => {
                 self.voice.recording = Some(rec);
                 self.voice.transcribe_state = TranscribeState::Recording;

@@ -369,7 +369,7 @@ mod tests {
             ),
             (
                 "edit",
-                "file_system.search_replace",
+                "file_system.edit",
                 json!({
                     "file_path": "example.txt",
                     "old_string": "old",
@@ -377,18 +377,15 @@ mod tests {
                 }),
                 json!({
                     "file_path": "example.txt",
-                    "content": [{
-                        "old_str": "old",
-                        "new_str": "new",
-                        "replace_all": false,
-                    }],
+                    "old_string": "old",
+                    "new_string": "new",
                 }),
             ),
             (
                 "bash",
                 "file_system.bash",
                 json!({"command": "pwd"}),
-                json!({"command": "pwd"}),
+                json!({"command": "pwd", "timeout_seconds": 120}),
             ),
         ];
         for (tool_name, runtime_name, model_arguments, runtime_arguments) in calls {
@@ -462,14 +459,14 @@ mod tests {
         assert_eq!(
             tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
             [
+                "direct_only",
+                "both",
                 "search_tool_functions",
                 "run_typescript",
                 "read_file",
                 "write_file",
                 "edit",
-                "bash",
-                "direct_only",
-                "both"
+                "bash"
             ]
         );
 

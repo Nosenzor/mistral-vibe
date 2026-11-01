@@ -48,6 +48,7 @@ pub enum MouseTarget {
     ModelPicker,
     ThinkingPicker,
     LogLevelPicker,
+    ArtifactsModal,
     ResumePicker,
     RemoteProject,
     ProxySetup,
@@ -59,6 +60,7 @@ pub enum MouseTarget {
     DebugConsole,
     Config,
     ConfigEditor,
+    ReleaseNotes,
     Trust,
     BottomBar,
     TodoRow,
@@ -248,6 +250,7 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
         MouseTarget::ModelPicker => model_picker::navigate(app, !up),
         MouseTarget::ThinkingPicker => thinking_picker::navigate(app, !up),
         MouseTarget::LogLevelPicker => log_level_picker::navigate(app, !up),
+        MouseTarget::ArtifactsModal => crate::artifacts_modal::navigate(app, !up),
         MouseTarget::ResumePicker => resume_picker::wheel(app, !up),
         MouseTarget::Mcp
         | MouseTarget::RemoteProject
@@ -259,6 +262,7 @@ fn handle_wheel(app: &mut App, event: MouseEvent) -> bool {
             }
         }
         MouseTarget::Plugins => crate::plugins::wheel(app, !up),
+        MouseTarget::ReleaseNotes => crate::release_notes::wheel(app, !up),
         MouseTarget::ProxySetup => app.proxy_setup.wheel(up, MOUSE_SCROLL_STEP as usize),
         MouseTarget::ConfigEditor => crate::config_edit::wheel(app, if up { -1 } else { 1 }),
         MouseTarget::Trust => crate::trust_folders::wheel(app, up),

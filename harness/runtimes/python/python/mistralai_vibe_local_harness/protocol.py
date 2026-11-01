@@ -34,7 +34,7 @@ RustRuntimeBuiltinToolName = Literal[
     "self.sleep",
     "file_system.read_file",
     "file_system.write_file",
-    "file_system.search_replace",
+    "file_system.edit",
     "file_system.bash",
     "skill.read",
     "process.start",
@@ -53,6 +53,7 @@ RustRuntimeBuiltinToolName = Literal[
     "agents.send_message",
     "agents.interrupt",
     "subagent.stop",
+    "file_system.search_replace",
 ]
 
 RUNTIME_BUILTIN_TOOL_NAMES: tuple[RustRuntimeBuiltinToolName, ...] = (
@@ -60,7 +61,7 @@ RUNTIME_BUILTIN_TOOL_NAMES: tuple[RustRuntimeBuiltinToolName, ...] = (
     "self.sleep",
     "file_system.read_file",
     "file_system.write_file",
-    "file_system.search_replace",
+    "file_system.edit",
     "file_system.bash",
     "skill.read",
     "process.start",
@@ -78,12 +79,14 @@ RUNTIME_BUILTIN_TOOL_NAMES: tuple[RustRuntimeBuiltinToolName, ...] = (
     "agents.send_message",
     "agents.interrupt",
     "subagent.stop",
+    "file_system.search_replace",
 )
 
 
-# Deprecated: retired `subagent.*` spellings, accepted only so restored Actions
-# can be failed with a migration hint. Use the `agents.*` names; `subagent.wait`
-# is replaced by standalone `wait` and `subagent.stop` has no replacement.
+# Deprecated: retired names, accepted only so restored Actions can be failed
+# with a migration hint. Use the `agents.*` names; `subagent.wait` is replaced
+# by standalone `wait`, `subagent.stop` has no replacement, and
+# `file_system.search_replace` is replaced by `file_system.edit`.
 DEPRECATED_RUNTIME_BUILTIN_TOOL_NAMES: frozenset[RustRuntimeBuiltinToolName] = (
     frozenset({
         "subagent.list",
@@ -92,6 +95,7 @@ DEPRECATED_RUNTIME_BUILTIN_TOOL_NAMES: frozenset[RustRuntimeBuiltinToolName] = (
         "subagent.interrupt",
         "subagent.wait",
         "subagent.stop",
+        "file_system.search_replace",
     })
 )
 
@@ -248,6 +252,31 @@ RustRuntimeToolFeature = Annotated[
 ]
 
 
+type RustReadFileDocuments = Literal["unsupported", "extracted_text"]
+type RustReadFileImages = Literal["unsupported", "extracted_text", "native"]
+
+
+class RustReadFileSupport(RustProtocolModel):
+    documents: RustReadFileDocuments = Field(
+        default="unsupported", exclude_if=lambda value: value == "unsupported"
+    )
+    images: RustReadFileImages = Field(
+        default="unsupported", exclude_if=lambda value: value == "unsupported"
+    )
+
+
+class RustEnabledFileSystem(RustEnabledRuntimeToolFeature):
+    read_file: RustReadFileSupport = Field(
+        default_factory=RustReadFileSupport,
+        exclude_if=lambda value: value == RustReadFileSupport(),
+    )
+
+
+RustFileSystemFeature = Annotated[
+    RustDisabledRuntimeToolFeature | RustEnabledFileSystem, Field(discriminator="mode")
+]
+
+
 class RustWhenConfiguredSkills(RustProtocolModel):
     mode: Literal["when_configured"] = "when_configured"
 
@@ -308,6 +337,26 @@ RustLargeOutputPolicy = Annotated[
 ]
 
 
+class RustBashTimeoutSettings(RustProtocolModel):
+    """Seconds a bash command may run, as the Host's Runtime runs it: by
+    default, and at most. Core states both to the model and gives a call
+    without a timeout the default; it has no values of its own. Core takes both
+    as JSON safe integers, at most 2**53 - 1, so a larger value is refused before
+    a session starts.
+    """
+
+    default_seconds: Annotated[int, Field(gt=0, le=9007199254740991)]
+    max_seconds: Annotated[int, Field(gt=0, le=9007199254740991)]
+
+    @model_validator(mode="after")
+    def validate_timeouts(self) -> Self:
+        if self.default_seconds > self.max_seconds:
+            raise ValueError(
+                "default_seconds must be less than or equal to max_seconds"
+            )
+        return self
+
+
 class RustUnixCommandEnvironment(RustProtocolModel):
     mode: Literal["unix"] = "unix"
 
@@ -343,19 +392,15 @@ class RustDisabledCompactionPolicy(RustProtocolModel):
 
 
 class RustAutomaticCompactionPolicy(RustProtocolModel):
+    """Compacts when model input reaches `RustModelFacts.compaction_threshold`."""
+
     mode: Literal["automatic"] = "automatic"
-    token_threshold: int = Field(gt=0)
 
 
 RustCompactionPolicy = Annotated[
     RustDisabledCompactionPolicy | RustAutomaticCompactionPolicy,
     Field(discriminator="mode"),
 ]
-
-
-class RustImageDeliverySettings(RustProtocolModel):
-    agent: Literal["native", "resource_link"] = "native"
-    compaction: Literal["native", "resource_link"] = "native"
 
 
 class RustDisabledOutputLimitRecovery(RustProtocolModel):
@@ -389,27 +434,76 @@ class RustNotificationSettings(RustProtocolModel):
     recent_ids: int = Field(default=1000, gt=0)
 
 
+class RustFixedImageCostRule(RustProtocolModel):
+    """Every delivered native image counts as the same number of tokens."""
+
+    kind: Literal["fixed"] = "fixed"
+    tokens: int = Field(gt=0)
+
+
+RustImageCostRule = Annotated[RustFixedImageCostRule, Field(discriminator="kind")]
+
+
 type RustInputModality = Literal["text", "image"]
+
+
+class RustModelFacts(RustProtocolModel):
+    """What the Runtime knows about the model; Core has no defaults for it."""
+
+    context_window: int = Field(gt=0)
+    compaction_threshold: int = Field(gt=0)
+    compaction_threshold_max: int = Field(gt=0)
+    # The kinds of input the model reads: text always, at most once each.
+    input_modalities: list[RustInputModality]
+    image_cost: RustImageCostRule
+
+    def accepts_images(self) -> bool:
+        """Whether the model reads images."""
+        return "image" in self.input_modalities
+
+    @model_validator(mode="after")
+    def _validate_threshold(self) -> Self:
+        if not (
+            self.compaction_threshold
+            <= self.compaction_threshold_max
+            < self.context_window
+        ):
+            raise ValueError(
+                "compaction_threshold <= compaction_threshold_max < context_window "
+                "must hold"
+            )
+        if "text" not in self.input_modalities:
+            raise ValueError("input_modalities must include text")
+        if len(set(self.input_modalities)) != len(self.input_modalities):
+            raise ValueError("input_modalities must not repeat a modality")
+        return self
 
 
 class RustContextSettings(RustProtocolModel):
     compaction: RustCompactionPolicy
-    # Mirrors Core: omitted for `resend`, the default for Runtimes that predate
-    # the standalone request. This Runtime's settings builders ask for
-    # `standalone`, since it reads the compaction `request` kind and shapes it.
-    compaction_fallback: Literal["resend", "standalone"] = Field(
-        default="resend", exclude_if=lambda value: value == "resend"
-    )
-    image_delivery: RustImageDeliverySettings = Field(
-        default_factory=RustImageDeliverySettings
-    )
     notifications: RustNotificationSettings = Field(
         default_factory=RustNotificationSettings
     )
-    image_token_cost: Literal["serialized_bytes", "fixed"] = "serialized_bytes"
-    input_modalities: list[RustInputModality] = Field(
-        default_factory=lambda: ["text", "image"]
+    model_facts: RustModelFacts
+    # The input kinds of a separate compaction model, checked like
+    # `model_facts.input_modalities`; omitted when compaction uses the agent
+    # model.
+    compaction_model_input_modalities: list[RustInputModality] | None = Field(
+        default=None, exclude_if=lambda value: value is None
     )
+
+    @model_validator(mode="after")
+    def _validate_compaction_model_input_modalities(self) -> Self:
+        modalities = self.compaction_model_input_modalities
+        if modalities is None:
+            return self
+        if "text" not in modalities:
+            raise ValueError("compaction_model_input_modalities must include text")
+        if len(set(modalities)) != len(modalities):
+            raise ValueError(
+                "compaction_model_input_modalities must not repeat a modality"
+            )
+        return self
 
 
 class RustProgrammaticToolSettings(RustProtocolModel):
@@ -441,9 +535,9 @@ class RustToolSettings(RustProtocolModel):
     programmatic: RustProgrammaticToolSettings
     subagents: RustAgentToolFeature
     background_processes: RustRuntimeToolFeature
-    file_system: RustRuntimeToolFeature = Field(
-        default_factory=RustEnabledRuntimeToolFeature,
-        exclude_if=lambda value: value.mode == "enabled",
+    file_system: RustFileSystemFeature = Field(
+        default_factory=RustEnabledFileSystem,
+        exclude_if=lambda value: value == RustEnabledFileSystem(),
     )
     command_environment: RustCommandEnvironment
     skills: RustSkillsFeature = Field(
@@ -451,6 +545,7 @@ class RustToolSettings(RustProtocolModel):
         exclude_if=lambda value: value.mode == "when_configured",
     )
     large_output: RustLargeOutputPolicy
+    bash_timeout: RustBashTimeoutSettings | None = None
 
 
 class RustHarnessSettings(RustProtocolModel):
@@ -783,6 +878,8 @@ class RustTokenUsage(RustProtocolModel):
     output_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_total(self) -> Self:
@@ -816,7 +913,8 @@ RustCompletionResultPart = Annotated[
 class RustCompletionResult(RustProtocolModel):
     parts: list[RustCompletionResultPart] = Field(min_length=1)
     finish_reason: RustCompletionFinishReason
-    usage: RustTokenUsage | None = None
+    # Required: a provider reply without usage is a Provider failure.
+    usage: RustTokenUsage
 
 
 class RustCandidateMessage(RustAssistantMessage):
@@ -1160,7 +1258,6 @@ class RustAgentResultNotificationSource(RustProtocolModel):
 class RustAgentMessageNotificationSource(RustProtocolModel):
     type: Literal["agent_message"] = "agent_message"
     sender_agent_path: str = Field(min_length=1)
-    kind: Literal["task", "message"]
 
 
 RustNotificationSource = Annotated[
@@ -1313,6 +1410,21 @@ class RustContextCompactionFailedObservation(RustProtocolModel):
     error: RustProtocolError
 
 
+type RustWarningCode = Literal[
+    "request_too_long", "compaction_summary_cut_off", "compaction_inputs_reduced"
+]
+
+
+class RustWarningObservation(RustProtocolModel):
+    """A degraded but handled situation. The session continues."""
+
+    type: Literal["warning"] = "warning"
+    turn_id: str | None
+    code: RustWarningCode
+    message: str
+    details: JsonValue
+
+
 class RustTurnFailedObservation(RustProtocolModel):
     type: Literal["turn_failed"] = "turn_failed"
     turn_id: str
@@ -1351,6 +1463,7 @@ RustObservation = Annotated[
     | RustAssistantMessageCommittedObservation
     | RustContextCompactedObservation
     | RustContextCompactionFailedObservation
+    | RustWarningObservation
     | RustTurnCompletedObservation
     | RustTurnInterruptedObservation
     | RustTurnFailedObservation,
@@ -1487,10 +1600,6 @@ class RustUserMessageEvent(RustProtocolModel):
     mode: Literal["queue", "steer"]
 
 
-class RustUnattributedAgentTaskContext(RustProtocolModel):
-    type: Literal["unattributed"] = "unattributed"
-
-
 class RustCurrentAgentTaskContext(RustProtocolModel):
     type: Literal["current"] = "current"
     recipient_agent_path: Annotated[str, Field(min_length=1)]
@@ -1503,17 +1612,13 @@ class RustInheritedAgentTaskContext(RustProtocolModel):
 
 
 type RustAgentTaskContext = Annotated[
-    RustUnattributedAgentTaskContext
-    | RustCurrentAgentTaskContext
-    | RustInheritedAgentTaskContext,
+    RustCurrentAgentTaskContext | RustInheritedAgentTaskContext,
     Field(discriminator="type"),
 ]
 
 
 class RustAgentTaskMessageContext(RustProtocolModel):
-    context: RustAgentTaskContext = Field(
-        default_factory=RustUnattributedAgentTaskContext
-    )
+    context: RustAgentTaskContext
     sender_agent_path: str = Field(min_length=1)
     kind: Literal["task"] = "task"
     content: list[RustContentBlock] = Field(min_length=1)
@@ -1883,7 +1988,7 @@ class RustSessionInspection(RustProtocolModel):
 
 
 class RustDeterminismContext(RustProtocolModel):
-    time_unix_ms: int = Field(ge=0, le=9_007_199_254_740_991)
+    time_unix_ms: int = Field(ge=0, le=9007199254740991)
     random_seed: int = Field(ge=0, le=4_294_967_295)
 
 
@@ -2044,6 +2149,7 @@ __all__ = [
     "RustAudioContentBlock",
     "RustAutomaticCompactionPolicy",
     "RustBackgroundProcessNotificationSource",
+    "RustBashTimeoutSettings",
     "RustBlobResourceContents",
     "RustCancelledAgentResult",
     "RustCandidateMessage",
@@ -2086,6 +2192,7 @@ __all__ = [
     "RustDispatchActionDirective",
     "RustEmbeddedResourceContentBlock",
     "RustEnabledAgentTools",
+    "RustEnabledFileSystem",
     "RustEnabledModelWait",
     "RustEnabledRuntimeToolFeature",
     "RustEvent",
@@ -2093,6 +2200,7 @@ __all__ = [
     "RustFailTurnEvent",
     "RustFailedAgentResult",
     "RustFailedTurn",
+    "RustFileSystemFeature",
     "RustFilesystemAction",
     "RustFilesystemFailedEvent",
     "RustFilesystemLargeOutputPolicy",
@@ -2101,6 +2209,7 @@ __all__ = [
     "RustFilesystemSucceededEvent",
     "RustFilesystemWriteOperation",
     "RustFilesystemWriteResult",
+    "RustFixedImageCostRule",
     "RustGitBashCommandEnvironment",
     "RustHarnessCapabilitySet",
     "RustHarnessConfig",
@@ -2122,10 +2231,9 @@ __all__ = [
     "RustHookToolCall",
     "RustIdleTurn",
     "RustImageContentBlock",
-    "RustImageDeliverySettings",
+    "RustImageCostRule",
     "RustInMemoryBashCommandEnvironment",
     "RustInputConflictRejection",
-    "RustInputModality",
     "RustInterruptEvent",
     "RustInterruptedTurn",
     "RustInvalidCommandRejection",
@@ -2139,6 +2247,7 @@ __all__ = [
     "RustLargeOutputPolicy",
     "RustLargeOutputSerializedObservation",
     "RustMessage",
+    "RustModelFacts",
     "RustModelInputUpdate",
     "RustModelMessageAppend",
     "RustModelMessageReplace",
@@ -2191,6 +2300,9 @@ __all__ = [
     "RustProvidedToolCallAction",
     "RustProvidedToolDefinition",
     "RustQueueFullRejection",
+    "RustReadFileDocuments",
+    "RustReadFileImages",
+    "RustReadFileSupport",
     "RustReasoningContent",
     "RustReasoningPart",
     "RustReasoningRedactedContent",
@@ -2252,6 +2364,8 @@ __all__ = [
     "RustUnixCommandEnvironment",
     "RustUserMessage",
     "RustUserMessageEvent",
+    "RustWarningCode",
+    "RustWarningObservation",
     "RustWhenConfiguredSkills",
     "json_schema_object",
     "parse_apply_result",

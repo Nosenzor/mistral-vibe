@@ -85,11 +85,13 @@ class SpawnModel:
 
 
 def spawn_models(config: VibeConfigSchema) -> tuple[SpawnModel, ...]:
+    from vibe.app_server._projection import offered_levels
+
     return tuple(
         SpawnModel(
             alias=model.alias,
             display_name=model.display_name,
-            levels=tuple(model.thinking_levels),
+            levels=tuple(offered_levels(config, model)),
         )
         for model in config.available_models().values()
     )
@@ -114,8 +116,13 @@ def start_session_input_schema(models: Sequence[SpawnModel]) -> dict[str, Any]:
     levels = "; ".join(
         f"{model.alias}: {', '.join(model.levels)}" for model in models if model.levels
     )
+    # The standard levels, then any level of a model's own its config lists.
+    offered_levels = dict.fromkeys((
+        *THINKING_LEVELS,
+        *(level for model in models for level in model.levels),
+    ))
     properties["reasoning_effort"] = {
-        "anyOf": [{"type": "string", "enum": list(THINKING_LEVELS)}, {"type": "null"}],
+        "anyOf": [{"type": "string", "enum": list(offered_levels)}, {"type": "null"}],
         "default": None,
         "description": (
             "How hard the model thinks, only when the user asks, among the levels "
@@ -132,7 +139,8 @@ class SessionSettings:
     """What a session runs on, which a session it starts inherits."""
 
     model: str
-    reasoning_effort: ThinkingLevel
+    # None when the config leaves it unset: the model's lowest setting applies.
+    reasoning_effort: ThinkingLevel | None
     approval_policy: str
 
 
@@ -140,7 +148,7 @@ def session_settings(config: VibeConfigSchema, agents: AgentManager) -> SessionS
     model = config.get_active_model()
     return SessionSettings(
         model=model.alias,
-        reasoning_effort=model.thinking,
+        reasoning_effort=model.thinking if model.thinking_is_set else None,
         approval_policy=agents.active_profile.name,
     )
 
@@ -191,8 +199,8 @@ async def run_start_session(
     origin = origin_of(parent_session_id)
     if origin.awaits_user:
         raise SessionSpawnError(
-            "Another session started this one, so it cannot start sessions until "
-            "the user writes to it. Do the task here."
+            "Another session started or messaged this one, so it cannot start "
+            "sessions until the user writes to it. Do the task here."
         )
     inherited = origin.settings
     model, reasoning_effort = _model_choice(args, origin)
@@ -225,7 +233,8 @@ async def run_start_session(
         ) from exc
     title = spawned.title or args.title
     return StartSessionResult(
-        session_id=spawned.session_id,
+        # The client's id is the one its peer tools take.
+        session_id=spawned.client_session_id or spawned.session_id,
         title=title,
         url=spawned.url,
         message=_started_message(title, spawned.url),
