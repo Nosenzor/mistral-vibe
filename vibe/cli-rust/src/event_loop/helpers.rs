@@ -145,6 +145,44 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
                 local::add_command_error(&mut app.view.transcript, &id, &error);
             }
         }
+        CommandEvent::PeerConfig { result, announce } => match result {
+            Ok(config) => {
+                app.peer.set_config(config.clone());
+                if announce {
+                    app.peer.open_unfocused();
+                    local::add_command_result(
+                        &mut app.view.transcript,
+                        &id,
+                        &crate::commands::peer::config_text(&config),
+                    );
+                }
+            }
+            Err(error) => {
+                if announce {
+                    local::add_command_error(&mut app.view.transcript, &id, &error);
+                }
+            }
+        },
+        CommandEvent::PeerSteer { review_id, result } => match result {
+            Ok(true) => {
+                app.peer.mark_delivered(&review_id);
+                local::add_command_result(
+                    &mut app.view.transcript,
+                    &id,
+                    "Peer critique delivered to the running turn.",
+                );
+            }
+            Ok(false) => local::add_command_error(
+                &mut app.view.transcript,
+                &id,
+                "The turn ended; the peer critique was not delivered.",
+            ),
+            Err(error) => local::add_command_error(
+                &mut app.view.transcript,
+                &id,
+                &format!("Failed to steer the peer critique: {error}"),
+            ),
+        },
     }
 }
 

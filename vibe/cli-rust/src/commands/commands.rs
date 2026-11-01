@@ -46,6 +46,7 @@ const COMMANDS: &[Command] = &[
     cmd(&["/help"], "Show help message", true),
     cmd(&["/config"], "Edit config settings", false),
     cmd(&["/model"], "Select active model", false),
+    cmd(&["/peer"], "Toggle the rubber-duck peer review panel; pass a model alias to enable, off to disable, steer on|off to toggle auto-steer", true).args("[model|off] [steer on|off]"),
     cmd(&["/thinking"], "Select thinking level", false),
     cmd(&["/reload"], "Reload configuration, agent instructions, and skills from disk", false),
     cmd(&["/clear", "/new"], "Start a new conversation. Optionally pass a prompt to seed it.", false).args("[prompt]"),

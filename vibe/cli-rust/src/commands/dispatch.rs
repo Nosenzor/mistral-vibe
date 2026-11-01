@@ -35,6 +35,7 @@ pub(super) fn run_command(
         "/proxy-setup" => crate::proxy_setup::open(app, client),
         "/theme" => theme_picker::open(app),
         "/model" => model_picker::open(app),
+        "/peer" => super::peer::run(app, client, value),
         "/thinking" => crate::thinking_picker::open(app),
         "/remote-project" => crate::vibe_code_project::open(app, client),
         "/teleport" => crate::teleport::command(app, client),

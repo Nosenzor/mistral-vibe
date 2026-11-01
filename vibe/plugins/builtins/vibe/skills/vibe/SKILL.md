@@ -332,15 +332,34 @@ provider = "mistral"
 alias = "vision"
 supports_images = true            # required
 
-# Optional: the model behind each background helper -- session titles and the
-# smart-approve classifier. A value is an alias from [[models]], or "active" for
-# the session's own model (unless a model is aliased "active"). Unset, a helper
-# uses a small fast Mistral model when the deployment serves one (checked when
-# a session opens with the feature on, then cached) and the session's model
-# otherwise, which costs more per call.
+# Optional: the model behind each background helper -- session titles, the
+# smart-approve classifier, and the rubber-duck peer reviewer. A value is an
+# alias from [[models]], or "active" for the session's own model (unless a
+# model is aliased "active"). Unset, a helper uses a small fast Mistral model
+# when the deployment serves one (checked when a session opens with the
+# feature on, then cached) and the session's model otherwise, which costs more
+# per call. The peer duck is off when `peer` is unset or ""; `/peer <model>`
+# overrides it for the session only.
 [utility_models]
 title = "local"
 smart_approve = "active"
+peer = "local"
+
+# Optional: rubber-duck peer review. While a turn runs, the duck model watches
+# it and streams critiques into the peer panel (`Ctrl+P` toggles it); the panel
+# lists each critique with its severity, and a focused `Enter` steers the
+# selected critique into the running turn (`d` dismisses it). The duck gets a
+# read-only tool loop (`read_file`, and `grep` when ripgrep is on PATH) that
+# follows your [tools.*] permissions and enabled/disabled tool lists, and it
+# never edits files. The session transcript and anything the duck reads go to
+# the duck model's provider.
+[peer_review]
+max_reviews_per_turn = 10         # Review budget per turn; further reviews are skipped
+max_tool_rounds = 4               # Read-only tool rounds per review
+auto_steer = false                # Deliver critiques at or above auto_steer_severity automatically
+auto_steer_severity = "critical"  # Minimum severity auto-steer delivers: info | warning | critical
+allow_web_tools = false           # Opt in: let the duck fetch public web pages without asking (web_search is not available to the duck yet)
+timeout_seconds = 60              # Per-call timeout; a timed-out review pauses the duck for one timeout period, then it retries within the turn
 ```
 
 ### Tool Configuration
@@ -1003,6 +1022,13 @@ session's model.
 - `/help` - Show help message
 - `/config` - Full-screen settings browser. Fields show their value and origin layer (default / TOML / env / override). Type to filter, arrows to move, Enter to edit; booleans toggle, closed-set fields (theme, models) pick from a list, scalars edit inline, complex fields open a JSON editor. The edit modal shows an inspector of the layers setting the field; edits persist to the user config (`~/.vibe/config.toml`) by default, `Tab` cycles the save target through the project config (`.vibe/config.toml`, when the project layer is active) and the ephemeral session override (until restart), and `Ctrl+R` clears the field one writable layer at a time toward the default. The `tools` field opens a grouped tool list with a per-tool config editor (permission, allow/deny lists, `Ctrl+E` for raw JSON). Enabling/disabling whole MCP servers or connectors stays in `/mcp`.
 - `/model` - Select active model. The footer shows the active model and its thinking level (`Name[level]`) before the token counter; clicking it opens `/model` and keeps the prompt being typed (only while idle, like the typed command). On narrow terminals the model is shortened first, then the working directory, and the model is hidden before the working directory gets very short.
+- `/peer [model|off] [steer on|off]` - Toggle the rubber-duck peer review panel
+  (also `Ctrl+P`). With a model alias, enables a second model that watches the
+  running turn and streams critiques into the panel; `off` disables it for this
+  session; `steer on|off` toggles auto-steer (critiques at or above
+  `peer_review.auto_steer_severity` are injected into the running turn). The
+  panel lists each critique with its severity; while it is focused, `Enter`
+  steers the selected critique into the running turn and `d` dismisses it.
 - `/thinking` - Select thinking level
 - `/theme` - Select UI theme; `auto` follows terminal/OS appearance (persisted in config)
 - `/reload` - Reload configuration, agent instructions, and skills from disk (skills added or edited on disk are also picked up on their own while `file_watcher_for_autocomplete` is on, except in sandboxed sessions)

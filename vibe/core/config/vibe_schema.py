@@ -53,6 +53,7 @@ from vibe.core.config.models import (
     MissingAPIKeyError,
     ModelConfig,
     OtelRedactionMode,
+    PeerReviewConfig,
     ProjectContextConfig,
     ProviderConfig,
     SessionLoggingConfig,
@@ -609,8 +610,9 @@ class VibeConfigSchema(ConfigSchema):
         default_factory=UtilityModelsConfig,
         description=(
             "Per-feature model for secondary completions (session titles, the"
-            " smart-approve classifier). Each value is a model alias from 'models'"
-            f" or '{ACTIVE_MODEL_SELECTOR}' to use the session's active model."
+            " smart-approve classifier, the peer reviewer). Each value is a"
+            " model alias from 'models' or"
+            f" '{ACTIVE_MODEL_SELECTOR}' to use the session's active model."
             " Unset leaves the feature on automatic selection."
         ),
     )
@@ -1090,6 +1092,16 @@ class VibeConfigSchema(ConfigSchema):
     experiments: Annotated[ExperimentsConfig, WithShallowMerge()] = Field(
         default_factory=ExperimentsConfig
     )
+    # Shallow: a layer setting one key must not reset the others.
+    peer_review: Annotated[PeerReviewConfig, WithShallowMerge()] = Field(
+        default_factory=PeerReviewConfig,
+        description=(
+            "Rubber-duck peer review: a secondary model (set via"
+            " [utility_models] peer) critiques the running turn live. This"
+            " group tunes the per-turn review budget, auto-steer, and the"
+            " duck's read-only web tools."
+        ),
+    )
 
     def smart_approve_offered(self) -> bool:
         """Whether smart-approve is exposed in the mode picker/cycle.
@@ -1564,6 +1576,24 @@ class VibeConfigSchema(ConfigSchema):
                 f"Utility model '{alias}' for '{feature.value}' {reason} — that "
                 "feature falls back to automatic model selection."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_peer_model_same_as_active(self) -> VibeConfigSchema:
+        # A duck reviewing its own output is pointless; warn when the peer
+        # alias names the active model directly or via the 'active' selector.
+        alias = self.utility_models.alias_for(UtilityFeature.PEER)
+        if not alias or alias not in {ACTIVE_MODEL_SELECTOR, self.active_model}:
+            return self
+        logger.warning(
+            "Utility model '%s' for 'peer' is the active model; "
+            "peer review needs a different model to be useful.",
+            alias,
+        )
+        self._validation_warnings.append(
+            f"Utility model '{alias}' for 'peer' is the active model — peer "
+            "review needs a different model to be useful."
+        )
         return self
 
     @model_validator(mode="after")

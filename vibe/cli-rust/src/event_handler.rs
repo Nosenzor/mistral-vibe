@@ -522,6 +522,7 @@ fn is_foreign_session_notification(app: &App, event: &Notification) -> bool {
             | notification::SESSION_STATS_UPDATED
             | notification::SESSION_SNAPSHOT
             | notification::CHILD_SESSION_UPDATED
+            | notification::PEER_REVIEW
             | notification::ARTIFACTS_CREATED
             | notification::ARTIFACTS_UPDATED
     ) {
@@ -889,6 +890,8 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         // keeps the URL from being handled twice.
         notification::MCP_AUTH_URL_LEGACY => {}
         notification::TELEPORT_EVENT => crate::teleport::on_event(app, client, &event.params),
+        // The rubber duck's critique stream feeds the peer panel.
+        notification::PEER_REVIEW => crate::peer::apply_review(app, &event.params),
         _ => {}
     }
     true

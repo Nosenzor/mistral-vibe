@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum, auto
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -18,6 +19,12 @@ from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._identity import IdentityGateway
 from vibe.app_server._imports import ImportsService
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._peer_review import (
+    PeerReviewController,
+    PeerReviewSessionPorts,
+    SessionBackendPeerReviewPorts,
+)
+from vibe.app_server._peer_tool_executor import WorkspacePeerToolExecutor
 from vibe.app_server._platform_credentials import ConnectionPlatformCredentialProvider
 from vibe.app_server._session_backend_port import (
     SessionBackend,
@@ -100,6 +107,9 @@ from vibe.app_server.protocol import (
     ModelConfigWriteParams,
     Notification,
     PageRequest,
+    PeerConfigureParams,
+    PeerReadParams,
+    PeerSteerParams,
     PlatformCredentialsInvalidatedParams,
     PlatformCredentialsResolveParams,
     PlatformCredentialsResolveResponse,
@@ -214,6 +224,9 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/reload",
     "config/model/write",
     "config/write",
+    "peer/configure",
+    "peer/read",
+    "peer/steer",
     "session/agent/update",
     "session/compact",
     "session/context/inject",
@@ -309,6 +322,7 @@ class AppServer:
         self._connector_catalog_service = connector_catalog_service
         self._plugin_catalog_service = plugin_catalog_service
         self._imports_service = imports_service
+        self._peer_review = PeerReviewController(notify=self._notify)
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
             raise TypeError(
@@ -334,7 +348,9 @@ class AppServer:
             session_id=backend.session_id, history=PageRequest(limit=history_limit)
         )
         if backend is self._backend_event_backend:
-            return await backend.read(params)
+            snapshot = await backend.read(params)
+            self._attach_peer_review(backend, snapshot)
+            return snapshot
         subscription = await backend.subscribe(params)
         previous = self._root
         self._root = backend
@@ -347,13 +363,36 @@ class AppServer:
                     "Failed to shut down previous session backend", exc_info=exc
                 )
             finally:
+                await self._detach_peer_review(previous.session_id)
                 if self._connector_catalog_service is not None:
                     self._connector_catalog_service.discard_session(previous.session_id)
         await self._replay_pending_backend_events(
             backend, subscription.snapshot.last_event_id
         )
         await self._flush_backend_events(backend)
-        return subscription.snapshot
+        snapshot = subscription.snapshot
+        self._attach_peer_review(backend, snapshot)
+        return snapshot
+
+    def _attach_peer_review(
+        self, backend: SessionBackend, snapshot: SessionReadResponse
+    ) -> None:
+        """Bind the duck's review loop to the activated session backend."""
+        cwd = snapshot.state.session.cwd
+        self._peer_review.attach(
+            backend.session_id,
+            PeerReviewSessionPorts(
+                backend=SessionBackendPeerReviewPorts(backend),
+                tool_executor=WorkspacePeerToolExecutor(
+                    Path(cwd) if cwd else Path.cwd()
+                ),
+            ),
+        )
+
+    async def _detach_peer_review(self, session_id: str) -> None:
+        """Cancel the duck's in-flight review and drop its per-session state."""
+        await self._peer_review.detach(session_id)
+        self._peer_review.forget(session_id)
 
     async def _replace_backend_event_task(
         self, backend: SessionBackend, subscription: SessionEventSubscription
@@ -397,6 +436,9 @@ class AppServer:
                 )
                 if runtime_updated is not None:
                     await self._route_notification("runtime/updated", runtime_updated)
+        # The rubber-duck tap: the controller never raises, so a duck failure
+        # cannot break the session's event stream (design §7.3).
+        await self._peer_review.handle_backend_event(envelope)
 
     async def _forward_connector_authorization(
         self, event: ConnectorAuthorizationRequiredEvent
@@ -571,8 +613,10 @@ class AppServer:
                 await self._session_backend_host.shutdown()
             finally:
                 self._root = None
-                if root is not None and self._connector_catalog_service is not None:
-                    self._connector_catalog_service.discard_session(root.session_id)
+                if root is not None:
+                    await self._detach_peer_review(root.session_id)
+                    if self._connector_catalog_service is not None:
+                        self._connector_catalog_service.discard_session(root.session_id)
 
     async def _detach_connection(self, transport: JsonRpcTransport) -> None:
         if self._transport is not transport:
@@ -934,6 +978,7 @@ class AppServer:
                     await cancel_tasks([backend_events], label="deleted session events")
                 self._root = None
                 self._callback_requests.clear()
+                await self._detach_peer_review(params.session_id)
                 if self._connector_catalog_service is not None:
                     self._connector_catalog_service.discard_session(params.session_id)
             return DispatchResult(response=response)
@@ -1355,7 +1400,31 @@ class AppServer:
                 return await self._dispatch_backend_config(root, method, raw_params)
             case "callback":
                 return await self._dispatch_backend_callback(root, method, raw_params)
+            case "peer":
+                return await self._dispatch_backend_peer(root, method, raw_params)
         return None
+
+    async def _dispatch_backend_peer(
+        self, root: SessionBackend, method: str, raw_params: dict[str, Any]
+    ) -> DispatchResult | None:
+        ports = SessionBackendPeerReviewPorts(root)
+        controller = self._peer_review
+        response: ProtocolModel
+        if method == "peer/configure":
+            response = await controller.configure(
+                validate_wire(PeerConfigureParams, raw_params), ports
+            )
+        elif method == "peer/read":
+            response = await controller.read(
+                validate_wire(PeerReadParams, raw_params), ports
+            )
+        elif method == "peer/steer":
+            response = await controller.steer(
+                validate_wire(PeerSteerParams, raw_params), ports
+            )
+        else:
+            return None
+        return DispatchResult(response)
 
     @staticmethod
     async def _dispatch_backend_session(

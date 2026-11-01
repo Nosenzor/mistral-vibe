@@ -112,6 +112,7 @@ from vibe.app_server.review import (
     ReviewScope,
     ReviewTarget,
 )
+from vibe.core.config import PeerSeverity
 from vibe.utils.mcp import MCPAddTransport
 
 SERVER_METHODS: tuple[str, ...] = (
@@ -167,6 +168,9 @@ SERVER_METHODS: tuple[str, ...] = (
     "mcp_catalog/remove",
     "mcp_catalog/toggle",
     "narration/summarize",
+    "peer/configure",
+    "peer/read",
+    "peer/steer",
     "plugin/info",
     "plugin/reload",
     "plugins/read",
@@ -3084,6 +3088,57 @@ class StatsUpdatedParams(EventNotificationParams):
 
 class ChildSessionUpdatedParams(EventNotificationParams):
     child_session: PublicChildSession
+
+
+class PeerReviewStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class PeerReviewParams(EventNotificationParams):
+    """The ``peer/review`` notification, emitted running then complete/failed."""
+
+    review_id: str
+    turn_id: str
+    target_entry_id: str | None = None
+    status: PeerReviewStatus
+    severity: PeerSeverity | None = None
+    steerable: bool = False
+    delivered: bool = False
+    text: str = ""
+    error: str | None = None
+
+
+class PeerConfigureParams(ProtocolModel):
+    session_id: str
+    # A model alias enables the duck for the session; absent leaves the
+    # current pick unchanged. `disable` turns the duck off.
+    model: str | None = None
+    disable: bool = False
+    auto_steer: bool | None = None
+
+
+class PeerConfigView(ProtocolModel):
+    enabled: bool
+    model: str | None = None
+    auto_steer: bool
+    max_reviews_per_turn: int
+    auto_steer_severity: PeerSeverity
+
+
+class PeerReadParams(ProtocolModel):
+    session_id: str
+
+
+class PeerSteerParams(ProtocolModel):
+    session_id: str
+    review_id: str
+
+
+class PeerSteerResponse(ProtocolModel):
+    accepted: bool
+    delivered: bool
 
 
 class ArtifactCreatedParams(EventNotificationParams):

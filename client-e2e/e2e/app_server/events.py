@@ -146,6 +146,36 @@ def turn_failed(
     )
 
 
+def peer_review(
+    review_id: str,
+    *,
+    status: str = "complete",
+    severity: str | None = None,
+    steerable: bool = False,
+    delivered: bool = False,
+    text: str = "",
+    error: str | None = None,
+    session_id: str | None = None,
+) -> AppServerEvent:
+    """Build a `peer/review` notification (running, then complete/failed)."""
+    return _event(
+        "peer/review",
+        {
+            "sessionId": session_id or SESSION_ID,
+            "emittedAt": _TIMESTAMP,
+            "reviewId": review_id,
+            "turnId": TURN_ID,
+            "targetEntryId": None,
+            "status": status,
+            "severity": severity,
+            "steerable": steerable,
+            "delivered": delivered,
+            "text": text,
+            "error": error,
+        },
+    )
+
+
 def queued_turn(enqueue_index: int, text: str = "") -> dict[str, Any]:
     """One still-queued prompt, identified by which enqueue accepted it (1-based)."""
     item_id = (

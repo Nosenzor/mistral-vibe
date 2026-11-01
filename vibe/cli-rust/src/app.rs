@@ -850,6 +850,8 @@ pub struct App {
     pub shown_config_warnings: HashSet<String>,
     /// The `/debug` console: a right-docked live view of the session logs.
     pub debug_console: crate::debug_console::DebugConsole,
+    /// The rubber-duck peer review panel.
+    pub peer: crate::peer::PeerState,
 }
 
 impl App {

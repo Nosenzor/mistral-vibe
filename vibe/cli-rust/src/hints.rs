@@ -23,6 +23,7 @@ pub mod key {
     pub const BACKSPACE_CTRL_C: &str = "Backspace/Ctrl+C";
     pub const CTRL_C: &str = "Ctrl+C";
     pub const CTRL_J: &str = "Ctrl+J";
+    pub const CTRL_P: &str = "Ctrl+P";
     pub const CTRL_R: &str = "Ctrl+R";
     pub const CTRL_S: &str = "Ctrl+S";
     pub const CTRL_BACKSLASH: &str = "Ctrl+\\";
@@ -76,6 +77,8 @@ pub mod action {
     pub const API_KEY: &str = "enter API key manually";
     pub const INTERRUPT: &str = "interrupt";
     pub const STEER: &str = "steer";
+    pub const DISMISS: &str = "dismiss";
+    pub const FOCUS: &str = "focus";
     pub const STOP: &str = "stop";
     pub const CANCEL_LAST_QUEUED: &str = "cancel last queued message";
     pub const REMOVE: &str = "remove";
@@ -91,6 +94,9 @@ pub const SEARCH: Hint = (key::SEARCH, action::SEARCH);
 pub const CANCEL: Hint = (key::ESC, action::CANCEL);
 pub const CLOSE: Hint = (key::ESC, action::CLOSE);
 pub const BACK: Hint = (key::ESC, action::BACK);
+pub const STEER: Hint = (key::ENTER, action::STEER);
+pub const DISMISS: Hint = ("d", action::DISMISS);
+pub const FOCUS: Hint = (key::CTRL_P, action::FOCUS);
 
 /// A hint row as `(text, is_key)` runs: `key action` pairs, two spaces apart.
 pub fn runs(hints: &[Hint]) -> Vec<(&'static str, bool)> {

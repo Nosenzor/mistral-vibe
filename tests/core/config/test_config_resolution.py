@@ -23,6 +23,7 @@ from vibe.core.config import (
     MissingAPIKeyError,
     ModelConfig,
     ProviderConfig,
+    UtilityFeature,
     VibeConfigSchema,
 )
 from vibe.core.config._migration import BASH_READ_ONLY_MIGRATION, migrate_config_layers
@@ -32,8 +33,10 @@ from vibe.core.config.harness_files import (
     init_harness_files_manager,
     reset_harness_files_manager,
 )
+from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.layers.user import UserConfigLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.config.patch import AddOperationPatch
 from vibe.core.paths import VIBE_HOME
 from vibe.core.trusted_folders import trusted_folders_manager
 from vibe.core.types import Backend
@@ -244,6 +247,85 @@ class TestMouseCaptureConfig:
         orch = await make_orchestrator()
 
         assert orch.config.enable_mouse_capture is False
+
+
+class TestPeerReviewConfig:
+    @pytest.mark.asyncio
+    async def test_reads_peer_settings_from_toml(
+        self,
+        config_dir: Path,
+        make_orchestrator: Callable[
+            [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+        ],
+    ) -> None:
+        config_file = config_dir / "config.toml"
+        with config_file.open("rb") as f:
+            data = tomllib.load(f)
+        data["utility_models"] = {"peer": "duck-model"}
+        data["peer_review"] = {"max_reviews_per_turn": 5, "auto_steer": True}
+        with config_file.open("wb") as f:
+            tomli_w.dump(data, f)
+
+        orch = await make_orchestrator()
+
+        assert orch.config.utility_models.peer == "duck-model"
+        assert orch.config.peer_review.max_reviews_per_turn == 5
+        assert orch.config.peer_review.auto_steer is True
+        # Shallow merge: keys the layer did not set keep their defaults.
+        assert orch.config.peer_review.max_tool_rounds == 4
+        assert orch.config.peer_review.allow_web_tools is False
+
+    @pytest.mark.asyncio
+    async def test_session_override_resolves_the_peer_model(
+        self,
+        config_dir: Path,
+        make_orchestrator: Callable[
+            [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+        ],
+    ) -> None:
+        config_file = config_dir / "config.toml"
+        with config_file.open("rb") as f:
+            data = tomllib.load(f)
+        data["models"].append({
+            "name": "duck-model",
+            "provider": "mistral",
+            "alias": "duck",
+        })
+        with config_file.open("wb") as f:
+            tomli_w.dump(data, f)
+
+        orch = await make_orchestrator()
+        # Off by default: no layer names a peer model.
+        assert orch.config.get_utility_model(UtilityFeature.PEER) is None
+
+        # /peer duck lands in the session override layer (the patch a
+        # config/write batch produces for /utility_models/peer), and runtime
+        # derivation resolves the peer model from it.
+        failures = await orch.apply_patch(
+            [
+                AddOperationPatch(
+                    path="/utility_models/peer",
+                    value="duck",
+                    target_layer_name=OverridesLayer.NAME,
+                )
+            ],
+            reason="peer review model override",
+        )
+        assert failures == []
+        peer = orch.config.get_utility_model(UtilityFeature.PEER)
+        assert peer is not None
+        assert peer.alias == "duck"
+
+        # The override layer is session memory: a reload re-reads the durable
+        # layers and keeps the session's pick.
+        await orch.reload()
+        peer = orch.config.get_utility_model(UtilityFeature.PEER)
+        assert peer is not None
+        assert peer.alias == "duck"
+
+        # A fresh session starts with an empty override layer: no duck.
+        fresh = await make_orchestrator()
+        assert fresh.config.get_utility_model(UtilityFeature.PEER) is None
 
 
 class TestSystemTrustStoreConfig:

@@ -135,6 +135,13 @@ pub mod method {
     pub const NARRATION_SUMMARIZE: &str = "narration/summarize";
     /// Remove a managed worktree (app-server `WorkspaceWorktreeRemoveParams`).
     pub const WORKSPACE_WORKTREE_REMOVE: &str = "workspace/git/worktrees/remove";
+    /// The rubber-duck peer review state (`/peer` with no argument).
+    pub const PEER_READ: &str = "peer/read";
+    /// Enable or disable the duck, or toggle auto-steer, for the session
+    /// (`/peer <model|off> [steer on|off]`).
+    pub const PEER_CONFIGURE: &str = "peer/configure";
+    /// Steer one critique into the running turn (the panel's Enter action).
+    pub const PEER_STEER: &str = "peer/steer";
     /// The session's PR/MR artifacts (app-server `artifacts/list`).
     pub const ARTIFACTS_LIST: &str = "artifacts/list";
 }
@@ -191,6 +198,8 @@ pub mod notification {
     pub const SESSION_LEASE_UPDATED: &str = "session/lease/updated";
     /// The server's lease watch died; held locks can no longer be trusted.
     pub const SESSION_LEASE_ENDED: &str = "session/lease/ended";
+    /// The rubber-duck peer review stream (running, then complete/failed).
+    pub const PEER_REVIEW: &str = "peer/review";
     /// A session artifact (PR/MR) was detected or discovered.
     pub const ARTIFACTS_CREATED: &str = "artifacts/created";
     /// A session artifact changed (markViewed, provider sync).

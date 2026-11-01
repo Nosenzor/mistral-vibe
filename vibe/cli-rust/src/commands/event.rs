@@ -83,6 +83,17 @@ pub enum CommandEvent {
     RetryFailed {
         error: String,
     },
+    /// The `/peer` config answer; `announce` mounts the state text and opens
+    /// the panel, the silent toggle-seed only stores it.
+    PeerConfig {
+        result: Result<crate::peer::PeerConfig, String>,
+        announce: bool,
+    },
+    /// The panel's steer action answered; `Ok(delivered)`.
+    PeerSteer {
+        review_id: String,
+        result: Result<bool, String>,
+    },
 }
 
 /// Claim a slot for one background command; the app stays busy until its event lands.

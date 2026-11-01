@@ -29,6 +29,7 @@ pub fn help_text() -> String {
         "- `Ctrl+C` Quit (or clear input if text present)".to_owned(),
         "- `Ctrl+G` Edit input in external editor".to_owned(),
         "- `Ctrl+O` Toggle tool output view".to_owned(),
+        "- `Ctrl+P` Toggle peer review panel".to_owned(),
         "- `Shift+Tab` Cycle through agents (ask, accept-edits, ...)".to_owned(),
         "- `Esc Esc` Rewind to a previous message (when input is empty)".to_owned(),
         String::new(),

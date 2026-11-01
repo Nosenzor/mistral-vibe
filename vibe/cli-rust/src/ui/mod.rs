@@ -29,6 +29,7 @@ pub mod mcp_oauth;
 pub mod model_picker;
 pub mod narrator;
 pub mod notice;
+pub mod peer;
 pub mod plugins;
 pub mod proxy_setup;
 pub mod pulse;
@@ -107,6 +108,9 @@ fn draw_active_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect)
     app.todo_sidebar.visible = sidebar.is_some();
     let (main, console) = debug_console::split(app, main);
     app.debug_console.visible = console.is_some();
+    // The peer panel docks last, so it sits leftmost of the docked columns.
+    let (main, peer_panel) = peer::split(app, main);
+    app.peer.visible = peer_panel.is_some();
     draw_session_screen(app, f, main);
     if let Some(sidebar) = sidebar {
         f.buffer_mut().set_style(sidebar, theme::screen_style());
@@ -114,6 +118,10 @@ fn draw_active_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect)
     }
     if let Some(panel) = console {
         debug_console::draw(app, f, panel);
+    }
+    if let Some(panel) = peer_panel {
+        f.buffer_mut().set_style(panel, theme::screen_style());
+        peer::draw_panel(app, f, panel);
     }
 }
 
