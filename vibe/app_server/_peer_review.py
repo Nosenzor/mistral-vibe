@@ -1,16 +1,38 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 import json
 import re
 import time
-from typing import Any, Protocol
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import JsonValue
+
+from mistralai_vibe_local_harness.protocol import (
+    RustAssistantMessage,
+    RustCompletionResultToolCallPart,
+    RustInvalidJsonToolArguments,
+    RustJsonToolArguments,
+    RustModelToolCallPart,
+    RustSystemMessage,
+    RustTextContentBlock,
+    RustToolDefinition,
+    RustToolMessage,
+    RustUserMessage,
+)
+
+if TYPE_CHECKING:
+    from mistralai_vibe_local_harness.protocol import (
+        RustAssistantPart,
+        RustCompletionResult,
+        RustMessage,
+        RustToolArguments,
+    )
 
 from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import RequestFailure
@@ -52,20 +74,25 @@ from vibe.app_server.protocol import (
     TurnSteerParams,
     TurnSteerResponse,
 )
-from vibe.core.config import ModelConfig, PeerSeverity, UtilityFeature, VibeConfigSchema
+from vibe.core.config import (
+    ModelConfig,
+    PeerSeverity,
+    ProviderConfig,
+    UtilityFeature,
+    VibeConfigSchema,
+)
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.models import ACTIVE_MODEL_SELECTOR
-from vibe.core.llm.backend.factory import create_backend
-from vibe.core.llm.types import BackendLike
 from vibe.core.prompts import UtilityPrompt
 from vibe.core.tools.base import BaseTool, ToolError
 from vibe.core.tools.builtins.grep import Grep
 from vibe.core.tools.builtins.read_file import ReadFile
 from vibe.core.tools.builtins.web_fetch import WebFetch
 from vibe.core.tools.builtins.web_search import WebSearch
-from vibe.core.types import AvailableFunction, AvailableTool, LLMMessage, Role, ToolCall
+from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 from vibe.observability.logging import logger
-from vibe.utils.http import get_user_agent
+from vibe.utils.api_keys import resolve_api_key
+from vibe.utils.http import get_user_agent, with_user_agent
 
 STEER_MESSAGE_PREFIX = "[rubber duck] "
 STEER_ADVISORY = (
@@ -108,26 +135,157 @@ type PeerReviewNotifyPort = Callable[[str, ProtocolModel], Awaitable[None]]
 """The server's notification fan-out; the controller never touches transports."""
 
 
+@dataclass(frozen=True, slots=True)
+class PeerChunk:
+    """One duck completion's reply: the assistant message (text plus tool calls)."""
+
+    message: LLMMessage
+
+
+class PeerBackend(Protocol):
+    """Transport for the duck's completions: an async context manager with complete()."""
+
+    async def __aenter__(self) -> PeerBackend: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None: ...
+
+    async def complete(
+        self,
+        *,
+        model: ModelConfig,
+        messages: Sequence[LLMMessage],
+        temperature: float | None,
+        tools: list[RustToolDefinition] | None,
+        tool_choice: str | None,
+        max_tokens: int | None,
+        extra_headers: dict[str, str] | None,
+    ) -> PeerChunk: ...
+
+
 class PeerReviewBackendFactory(Protocol):
     """Builds the LLM backend a duck completion runs on."""
 
     def backend_for(
         self, model: ModelConfig, config: VibeConfigSchema
-    ) -> BackendLike: ...
+    ) -> PeerBackend: ...
 
 
 class ConfigPeerReviewBackendFactory:
     """Builds the duck's backend from the effective config (mirrors _narration)."""
 
-    def backend_for(self, model: ModelConfig, config: VibeConfigSchema) -> BackendLike:
-        return create_backend(
-            provider=config.get_provider_for_model(model),
-            timeout=config.api_timeout,
-            retry_max_elapsed_time=config.api_retry_max_elapsed_time,
-            connect_timeout=config.api_connect_timeout,
-            write_timeout=config.api_write_timeout,
-            pool_timeout=config.api_pool_timeout,
+    def backend_for(self, model: ModelConfig, config: VibeConfigSchema) -> PeerBackend:
+        return HarnessPeerBackend(
+            provider=config.get_provider_for_model(model), config=config
         )
+
+
+class HarnessPeerBackend:
+    """Runs duck completions on the Harness provider adapters (the v3 completion path).
+
+    The adapters own one HTTP client per call, so the context manager is a no-op;
+    it keeps the controller's ``async with backend:`` shape. ``tool_choice`` is
+    accepted for the port's shape and dropped: offering tools implies "auto",
+    and the adapters take no other choice.
+    """
+
+    def __init__(self, *, provider: ProviderConfig, config: VibeConfigSchema) -> None:
+        self._provider = provider
+        self._config = config
+
+    async def __aenter__(self) -> HarnessPeerBackend:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        return None
+
+    async def complete(
+        self,
+        *,
+        model: ModelConfig,
+        messages: Sequence[LLMMessage],
+        temperature: float | None,
+        tools: list[RustToolDefinition] | None,
+        tool_choice: str | None,
+        max_tokens: int | None,
+        extra_headers: dict[str, str] | None,
+    ) -> PeerChunk:
+        # Imported here: the Harness pulls the provider SDKs, which stay off the
+        # CLI startup path.
+        from mistralai_vibe_local_harness.vibe import (
+            LocalModelRoute,
+            LocalRuntimeAdapterConfig,
+            ProviderCredentialSnapshot,
+        )
+        from mistralai_vibe_local_harness.vibe.adapters.generic import (
+            execute_generic_completion,
+        )
+        from mistralai_vibe_local_harness.vibe.adapters.mistral import (
+            execute_mistral_completion,
+        )
+
+        provider = self._provider
+        config = self._config
+        token = (
+            resolve_api_key(provider.api_key_env_var)
+            if provider.api_key_env_var
+            else None
+        )
+        headers = with_user_agent(
+            {**provider.extra_headers, **(extra_headers or {})}, str(provider.backend)
+        )
+        adapter_config = LocalRuntimeAdapterConfig(
+            provider=provider.name,
+            backend=str(provider.backend),
+            api_style=provider.api_style,
+            base_url=provider.api_base,
+            max_tokens=max_tokens,
+            reasoning_field_name=provider.reasoning_field_name,
+            emits_finish_reason=provider.emits_finish_reason,
+            extra_headers=headers,
+            project_id=provider.project_id,
+            region=provider.region,
+            timeout_s=config.api_timeout,
+            stream_idle_timeout_s=config.api_stream_idle_timeout or None,
+            retry_max_elapsed_time_s=config.api_retry_max_elapsed_time,
+            enable_system_trust_store=config.enable_system_trust_store,
+        )
+        route = LocalModelRoute(
+            model=model.name,
+            # top_p belongs to the model's own temperature: Mistral rejects it
+            # alongside greedy sampling.
+            temperature=model.temperature if temperature is None else temperature,
+            top_p=model.top_p if temperature is None else None,
+            max_output_tokens=model.max_output_tokens,
+        )
+        credential = ProviderCredentialSnapshot(
+            token=token, headers={}, revision=provider.name
+        )
+        wire_messages = _to_wire_messages(messages)
+        wire_tools = list(tools or [])
+        match str(provider.backend):
+            case "mistral":
+                result = await execute_mistral_completion(
+                    wire_messages, wire_tools, adapter_config, credential, route
+                )
+            case "generic":
+                result = await execute_generic_completion(
+                    wire_messages, wire_tools, adapter_config, credential, route=route
+                )
+            case other:
+                raise RuntimeError(
+                    f"Unsupported completion backend for peer review: {other}"
+                )
+        return _to_peer_chunk(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1073,28 +1231,103 @@ _CATALOG_TOOL_CLASSES: tuple[type[BaseTool[Any, Any, Any, Any]], ...] = (
 )
 
 
-def _tool_catalog(supported: frozenset[str]) -> list[AvailableTool]:
+def _tool_catalog(supported: frozenset[str]) -> list[RustToolDefinition]:
     """The duck's advertised tools: the read-only classes the executor runs.
 
     ``web_search`` only appears when the executor supports it — the workspace
     executor does not in v1 (no Python search client exists; the runtime runs
     it in Rust), so the catalog honestly omits it.
     """
-    catalog: list[AvailableTool] = []
+    catalog: list[RustToolDefinition] = []
     for tool_class in _CATALOG_TOOL_CLASSES:
         name = tool_class.get_name()
         if name not in supported:
             continue
         catalog.append(
-            AvailableTool(
-                function=AvailableFunction(
-                    name=name,
-                    description=tool_class.get_full_description(),
-                    parameters=tool_class.get_parameters(),
-                )
+            RustToolDefinition(
+                name=name,
+                description=tool_class.get_full_description(),
+                parameters=tool_class.get_parameters(),
             )
         )
     return catalog
+
+
+def _to_wire_messages(messages: Sequence[LLMMessage]) -> list[RustMessage]:
+    """The duck's LLMMessage conversation in the Harness wire format.
+
+    Unlike the utility-completion converter, this keeps the tool loop: assistant
+    tool calls become ``RustModelToolCallPart`` and tool results become
+    ``RustToolMessage``.
+    """
+    converted: list[RustMessage] = []
+    for message in messages:
+        text = message.content or ""
+        match message.role:
+            case Role.system:
+                if text:
+                    converted.append(
+                        RustSystemMessage(content=[RustTextContentBlock(text=text)])
+                    )
+            case Role.user:
+                if text:
+                    converted.append(
+                        RustUserMessage(content=[RustTextContentBlock(text=text)])
+                    )
+            case Role.assistant:
+                parts: list[RustAssistantPart] = []
+                if text:
+                    parts.append(RustTextContentBlock(text=text))
+                for call in message.tool_calls or []:
+                    parts.append(
+                        RustModelToolCallPart(
+                            id=call.id or "",
+                            name=call.function.name or "",
+                            arguments=_wire_tool_arguments(call.function.arguments),
+                        )
+                    )
+                if parts:
+                    converted.append(RustAssistantMessage(content=parts))
+            case Role.tool:
+                converted.append(
+                    RustToolMessage(
+                        tool_call_id=message.tool_call_id or "",
+                        name=message.name or "",
+                        outcome="success",
+                        content=[RustTextContentBlock(text=text)] if text else [],
+                    )
+                )
+    return converted
+
+
+def _wire_tool_arguments(raw: str | None) -> RustToolArguments:
+    """The replayed tool call's arguments in the Harness wire format."""
+    text = raw or "{}"
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return RustInvalidJsonToolArguments(raw=text, error="invalid JSON arguments")
+    return RustJsonToolArguments(raw=text, value=value)
+
+
+def _to_peer_chunk(result: RustCompletionResult) -> PeerChunk:
+    """The adapter's completion result back into a duck reply message."""
+    text = "".join(
+        part.text for part in result.parts if isinstance(part, RustTextContentBlock)
+    )
+    tool_calls = [
+        ToolCall(
+            id=part.id,
+            function=FunctionCall(name=part.name, arguments=part.arguments_json),
+        )
+        for part in result.parts
+        if isinstance(part, RustCompletionResultToolCallPart)
+    ]
+    return PeerChunk(
+        message=LLMMessage(
+            role=Role.assistant, content=text, tool_calls=tool_calls or None
+        )
+    )
 
 
 _FENCED_JSON = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)

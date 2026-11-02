@@ -29,6 +29,7 @@ from vibe.core.tools.builtins.read_file import (
 from vibe.core.tools.builtins.web_fetch import WebFetchConfig
 from vibe.core.tools.utils import matches_sensitive_pattern, resolve_path_permission
 from vibe.core.utils import name_matches
+from vibe.core.workspace import Workspace
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context, get_user_agent
 from vibe.utils.io import decode_safe, split_lines_verbatim
 
@@ -155,6 +156,7 @@ class WorkspacePeerToolExecutor:
 
     def __init__(self, cwd: Path, *, policy: PeerToolPolicy | None = None) -> None:
         self._cwd = cwd.expanduser().resolve()
+        self._workspace = Workspace.for_session(self._cwd)
         self._policy = policy or PeerToolPolicy()
 
     @property
@@ -376,7 +378,7 @@ class WorkspacePeerToolExecutor:
         return any(
             resolve_path_permission(
                 str(self._cwd.joinpath(*parts[:depth])),
-                cwd=self._cwd,
+                workspace=self._workspace,
                 allowlist=[],
                 denylist=config.denylist,
             )

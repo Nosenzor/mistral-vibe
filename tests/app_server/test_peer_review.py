@@ -15,6 +15,7 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import DispatchResult, RequestFailure
+from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._model import validate_wire
 from vibe.app_server._patch import make_json_patch
 import vibe.app_server._peer_review as peer_review_module
@@ -22,6 +23,7 @@ from vibe.app_server._peer_review import (
     PEER_LEDGER_MAX_CONCERNS,
     PEER_MIRROR_MAX_ENTRIES,
     STEER_MESSAGE_PREFIX,
+    PeerChunk,
     PeerReviewController,
     PeerReviewSessionPorts,
     StoredPeerReview,
@@ -31,6 +33,7 @@ from vibe.app_server._peer_tool_executor import (
     PeerToolPolicy,
     WorkspacePeerToolExecutor,
 )
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._session_backend_port import (
     SessionBackend,
     SessionBackendEvent,
@@ -85,9 +88,10 @@ from vibe.app_server.server import AppServer
 from vibe.app_server.transport import memory_transport_pair
 from vibe.core.autocompletion.path_prompt import build_path_prompt_payload
 from vibe.core.config import ModelConfig, PeerSeverity, VibeConfigSchema
+from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.tools.base import ToolError
-from vibe.core.types import FunctionCall, LLMChunk, LLMMessage, Role, ToolCall
+from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 
 
 def _config(**overrides: Any) -> VibeConfigSchema:
@@ -493,19 +497,25 @@ class _FakeBackendHost:
     async def shutdown(self) -> None: ...
 
 
-def _make_server() -> AppServer:
+def _make_server(process_services: ProcessServices) -> AppServer:
     _client_transport, server_transport = memory_transport_pair()
     return AppServer(
         server_transport,
         session_backend_host_factory=lambda _: cast(
             SessionBackendHost, _FakeBackendHost()
         ),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+        ),
     )
 
 
 @pytest.mark.asyncio
-async def test_peer_methods_route_to_the_controller() -> None:
-    server = _make_server()
+async def test_peer_methods_route_to_the_controller(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     root = cast(SessionBackend, _FakeRootBackend(_config()))
 
     result = await server._dispatch_backend_operation(
@@ -531,8 +541,10 @@ async def test_peer_methods_route_to_the_controller() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_configure_writes_the_session_overrides_layer() -> None:
-    server = _make_server()
+async def test_peer_configure_writes_the_session_overrides_layer(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     backend = _FakeRootBackend(_config())
     root = cast(SessionBackend, backend)
 
@@ -580,8 +592,10 @@ async def test_peer_configure_writes_the_session_overrides_layer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_methods_reject_malformed_payloads() -> None:
-    server = _make_server()
+async def test_peer_methods_reject_malformed_payloads(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     root = cast(SessionBackend, _FakeRootBackend(_config()))
 
     with pytest.raises(ValidationError):
@@ -591,8 +605,10 @@ async def test_peer_methods_reject_malformed_payloads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_configure_records_telemetry_through_the_backend() -> None:
-    server = _make_server()
+async def test_peer_configure_records_telemetry_through_the_backend(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     backend = _FakeRootBackend(_config())
     root = cast(SessionBackend, backend)
 
@@ -614,8 +630,10 @@ async def test_peer_configure_records_telemetry_through_the_backend() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_steer_records_telemetry_through_the_backend() -> None:
-    server = _make_server()
+async def test_peer_steer_records_telemetry_through_the_backend(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     backend = _FakeRootBackend(_config())
     root = cast(SessionBackend, backend)
     server._peer_review.store_review(
@@ -708,8 +726,10 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> None
 
 
 @pytest.mark.asyncio
-async def test_peer_review_lifecycle_follows_backend_activation() -> None:
-    server = _make_server()
+async def test_peer_review_lifecycle_follows_backend_activation(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     backend = _FakeSessionBackend(_config(utility_models={"peer": "beta"}))
 
     await server._activate_backend(cast(SessionBackend, backend), 200)
@@ -737,8 +757,10 @@ async def test_peer_review_lifecycle_follows_backend_activation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_review_state_dies_with_server_close() -> None:
-    server = _make_server()
+async def test_peer_review_state_dies_with_server_close(
+    process_services: ProcessServices,
+) -> None:
+    server = _make_server(process_services)
     backend = cast(SessionBackend, _FakeSessionBackend(_config()))
     await server._activate_backend(backend, 200)
     assert "session-1" in server._peer_review._sessions
@@ -749,7 +771,9 @@ async def test_peer_review_state_dies_with_server_close() -> None:
 
 
 @pytest.mark.asyncio
-async def test_peer_review_state_dies_with_session_delete() -> None:
+async def test_peer_review_state_dies_with_session_delete(
+    process_services: ProcessServices,
+) -> None:
     class _DeleteHost:
         async def delete(self, params: SessionDeleteParams) -> EmptyResponse:
             return EmptyResponse()
@@ -758,6 +782,10 @@ async def test_peer_review_state_dies_with_session_delete() -> None:
     server = AppServer(
         server_transport,
         session_backend_host_factory=lambda _: cast(SessionBackendHost, _DeleteHost()),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+        ),
     )
     backend = cast(SessionBackend, _FakeSessionBackend(_config()))
     await server._activate_backend(backend, 200)
@@ -814,7 +842,7 @@ class _GatedBackend(FakeBackend):
         super().__init__(chunks)
         self._gate = gate
 
-    async def complete(self, **kwargs: Any) -> LLMChunk:
+    async def complete(self, **kwargs: Any) -> PeerChunk:
         await self._gate.wait()
         return await super().complete(**kwargs)
 
@@ -826,7 +854,7 @@ class _HangOnceBackend(FakeBackend):
         super().__init__(chunks)
         self._hung = False
 
-    async def complete(self, **kwargs: Any) -> LLMChunk:
+    async def complete(self, **kwargs: Any) -> PeerChunk:
         if not self._hung:
             self._hung = True
             await asyncio.Event().wait()
@@ -840,7 +868,7 @@ class _SlowBackend(FakeBackend):
         super().__init__(chunks)
         self._delay = delay
 
-    async def complete(self, **kwargs: Any) -> LLMChunk:
+    async def complete(self, **kwargs: Any) -> PeerChunk:
         await asyncio.sleep(self._delay)
         return await super().complete(**kwargs)
 
@@ -968,7 +996,7 @@ def _entry_updated(
 
 def _verdict_chunk(
     severity: str = "info", steerable: bool = False, text: str = "No concerns."
-) -> LLMChunk:
+) -> PeerChunk:
     return mock_llm_chunk(
         content=json.dumps({"severity": severity, "steerable": steerable, "text": text})
     )
@@ -976,7 +1004,7 @@ def _verdict_chunk(
 
 def _tool_call_chunk(
     name: str, arguments: dict[str, Any], call_id: str = "call-1"
-) -> LLMChunk:
+) -> PeerChunk:
     return mock_llm_chunk(
         tool_calls=[
             ToolCall(
@@ -1314,7 +1342,7 @@ async def test_tool_calls_are_executed_and_results_fed_back() -> None:
     assert tool_messages[0].name == "read_file"
     assert tool_messages[0].tool_call_id == "call-1"
     assert "result:read_file" in _message_text(tool_messages[0])
-    catalog_names = [tool.function.name for tool in backend.requests_tools[0]]
+    catalog_names = [tool.name for tool in backend.requests_tools[0]]
     assert catalog_names == ["read_file", "grep", "web_fetch"]
 
 
@@ -1388,7 +1416,7 @@ async def test_catalog_omits_web_tools_by_default() -> None:
     )
     await _drain(controller)
 
-    catalog_names = [tool.function.name for tool in backend.requests_tools[0]]
+    catalog_names = [tool.name for tool in backend.requests_tools[0]]
     assert catalog_names == ["read_file", "grep"]
 
 
@@ -1739,7 +1767,7 @@ async def test_the_catalog_follows_the_effective_tool_policy() -> None:
     )
     await _drain(controller)
 
-    catalog_names = [tool.function.name for tool in backend.requests_tools[0]]
+    catalog_names = [tool.name for tool in backend.requests_tools[0]]
     assert catalog_names == ["read_file", "grep"]
 
 
