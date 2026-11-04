@@ -11,7 +11,7 @@ import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol
 
-from pydantic import JsonValue
+from pydantic import BaseModel, JsonValue
 
 from mistralai_vibe_local_harness.protocol import (
     RustAssistantMessage,
@@ -41,10 +41,15 @@ from vibe.app_server._patch import apply_json_patch
 from vibe.app_server._peer_tool_executor import PeerReviewToolExecutor, PeerToolPolicy
 from vibe.app_server._session_backend_port import (
     SessionBackend,
+    SessionBackendError,
     SessionBackendEvent,
     SessionBackendExtension,
 )
 from vibe.app_server.models import (
+    CompletedEffectState,
+    EffectState,
+    FailedEffectState,
+    PendingEffectState,
     PublicEffectEntry,
     PublicEntryGenerationStatus,
     PublicHistoryEntry,
@@ -52,6 +57,7 @@ from vibe.app_server.models import (
     PublicNoticeEntry,
     PublicTurn,
     PublicTurnStatus,
+    SkippedEffectState,
     TextContentBlock,
     validate_history_entry,
 )
@@ -105,6 +111,9 @@ _MENTION_ANCHOR = re.compile(r"(?<!\w)@")
 # duck's independent context bounded under pressure (design §7.5).
 PEER_MIRROR_MAX_ENTRIES = 40
 PEER_LEDGER_MAX_CONCERNS = 10
+# One tool effect's input/output are clipped per field, so a single huge tool
+# result cannot blow the entry-count-bounded mirror.
+PEER_EFFECT_FIELD_MAX_CHARS = 2_000
 
 # Telemetry events (design §7.8, ADR 0008): closed vocabularies and counts
 # only — never critique text, exception messages, or model content.
@@ -316,7 +325,13 @@ class SessionBackendPeerReviewPorts:
         )
 
     async def steer(self, params: TurnSteerParams) -> TurnSteerResponse:
-        return (await self._root.steer_turn(params)).response
+        try:
+            return (await self._root.steer_turn(params)).response
+        except SessionBackendError as exc:
+            # The controller reports steer failures as accepted=false; the
+            # backend speaks SessionBackendError (e.g. stale turn once the
+            # turn completed), so translate at the port boundary.
+            raise RequestFailure(exc.code, str(exc), exc.data) from exc
 
     async def record_event(self, name: str, properties: dict[str, Any]) -> None:
         # Telemetry rides the session's `telemetry/record` extension — the same
@@ -1170,17 +1185,62 @@ def _mirror_text(entry: PublicHistoryEntry) -> str | None:
     """The duck's text-only view of one history entry.
 
     Reasoning, callbacks and checkpoints are harness plumbing the duck never
-    sees (design §7.4: the mirror is text-only).
+    sees (design §7.4: the mirror is text-only). Tool calls and results are
+    effects, so they carry their input and output — without them the duck
+    would only ever see plain messages.
     """
     match entry:
         case PublicMessageEntry():
             return f"{entry.role}: {entry.text}"
         case PublicEffectEntry():
-            return f"effect: {entry.title} ({entry.state.status})"
+            return _effect_text(entry)
         case PublicNoticeEntry():
             return f"notice[{entry.level}]: {entry.message}"
         case _:
             return None
+
+
+def _effect_text(entry: PublicEffectEntry) -> str:
+    """One tool effect as the duck sees it: title, status, input, output."""
+    lines = [f"effect: {entry.title} ({entry.state.status})"]
+    if entry.detail.input is not None:
+        lines.append(f"input: {_clip(_json_text(entry.detail.input))}")
+    output_text = _effect_output_text(entry.state)
+    if output_text:
+        lines.append(f"output: {_clip(output_text)}")
+    return "\n".join(lines)
+
+
+def _effect_output_text(state: EffectState) -> str:
+    """The effect's result text: the transcript when there is one, else the
+    structured output (a read_file's body lives in ``output.content``, not in
+    ``output_text``).
+    """
+    match state:
+        case PendingEffectState() | SkippedEffectState():
+            return ""
+        case CompletedEffectState() | FailedEffectState():
+            if state.output_text:
+                return state.output_text
+            if state.output is not None:
+                return _json_text(state.output)
+            return ""
+        case _:
+            return state.output_text
+
+
+def _json_text(value: Any) -> str:
+    # Effect inputs are pydantic models; dump with field names (not wire
+    # aliases) so they match the tool schemas the duck's catalog advertises.
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _clip(text: str, limit: int = PEER_EFFECT_FIELD_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}… [+{len(text) - limit} chars]"
 
 
 def _build_context(state: _SessionPeerState, mirror: list[PublicHistoryEntry]) -> str:

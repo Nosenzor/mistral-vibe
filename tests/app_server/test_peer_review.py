@@ -15,6 +15,7 @@ from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.app_server._config_paths import UTILITY_MODEL_PEER_PATH
 from vibe.app_server._dispatch import DispatchResult, RequestFailure
+from vibe.app_server._effect_models import GenericEffectDetail
 from vibe.app_server._host import HostRequestHandler
 from vibe.app_server._model import validate_wire
 from vibe.app_server._patch import make_json_patch
@@ -26,6 +27,7 @@ from vibe.app_server._peer_review import (
     PeerChunk,
     PeerReviewController,
     PeerReviewSessionPorts,
+    SessionBackendPeerReviewPorts,
     StoredPeerReview,
 )
 from vibe.app_server._peer_tool_executor import (
@@ -36,6 +38,7 @@ from vibe.app_server._peer_tool_executor import (
 from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._session_backend_port import (
     SessionBackend,
+    SessionBackendError,
     SessionBackendEvent,
     SessionBackendHost,
     SessionBackendResult,
@@ -49,8 +52,11 @@ from vibe.app_server.events import (
     TurnStarted,
 )
 from vibe.app_server.models import (
+    CompletedEffectState,
     IdleSessionStatus,
+    PublicEffectEntry,
     PublicEntryGenerationStatus,
+    PublicHistoryEntry,
     PublicMessageEntry,
     PublicSession,
     PublicSessionState,
@@ -92,6 +98,7 @@ from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.tools.base import ToolError
 from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
+from vibe.utils.tool_presentation import EffectCallDisplay, EffectResultDisplay
 
 
 def _config(**overrides: Any) -> VibeConfigSchema:
@@ -953,7 +960,7 @@ def _message_entry(
     )
 
 
-def _entry_added(entry: PublicMessageEntry) -> SessionBackendEvent:
+def _entry_added(entry: PublicHistoryEntry) -> SessionBackendEvent:
     params = HistoryEntryAddedParams(
         event_id=1,
         session_id=entry.session_id,
@@ -2270,3 +2277,97 @@ async def test_the_final_message_is_reviewed_even_if_a_review_runs_at_turn_end()
 
     assert len(backend.requests_messages) == 2
     assert "assistant: final summary" in _user_content(backend, 1)
+
+
+def _effect_entry(
+    entry_id: str = "effect-1",
+    *,
+    tool_input: Any = None,
+    output: Any = None,
+    output_text: str = "",
+    title: str = "file_system.read_file",
+) -> PublicEffectEntry:
+    return PublicEffectEntry(
+        id=entry_id,
+        session_id="session-1",
+        turn_id="turn-1",
+        created_at=1,
+        updated_at=1,
+        generation_status=PublicEntryGenerationStatus.COMPLETED,
+        title=title,
+        detail=GenericEffectDetail(
+            tool_name=title,
+            display=EffectCallDisplay(
+                summary=f"Running {title}", status_text="running"
+            ),
+            input=tool_input,
+        ),
+        state=CompletedEffectState(
+            output=output,
+            output_text=output_text,
+            duration_ms=0,
+            display=EffectResultDisplay(success=True, message="done"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_effect_entries_mirror_tool_input_and_output() -> None:
+    backend = FakeBackend(chunks=[_verdict_chunk()])
+    controller, _, _, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(
+            _effect_entry(
+                tool_input={"file_path": "a.py"},
+                output={"content": "FILE BODY MARKER", "num_lines": 1},
+            )
+        )
+    )
+    await _drain(controller)
+
+    user_content = _user_content(backend)
+    assert "effect: file_system.read_file (completed)" in user_content
+    assert "file_path" in user_content and "a.py" in user_content
+    assert "FILE BODY MARKER" in user_content
+
+
+@pytest.mark.asyncio
+async def test_effect_fields_are_clipped_to_keep_the_mirror_bounded() -> None:
+    backend = FakeBackend(chunks=[_verdict_chunk()])
+    controller, _, _, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+    huge = "x" * (peer_review_module.PEER_EFFECT_FIELD_MAX_CHARS + 100)
+
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+    await controller.handle_backend_event(
+        _entry_added(_effect_entry(output={"content": huge}))
+    )
+    await _drain(controller)
+
+    user_content = _user_content(backend)
+    assert "[+" in user_content and "chars]" in user_content
+    assert huge not in user_content
+
+
+@pytest.mark.asyncio
+async def test_steer_port_translates_backend_errors_into_request_failure() -> None:
+    class _StaleBackend:
+        session_id = "session-1"
+
+        async def steer_turn(self, params: TurnSteerParams) -> Any:
+            raise SessionBackendError(ProtocolErrorCode.CONFLICT, "stale turn")
+
+    ports = SessionBackendPeerReviewPorts(cast(SessionBackend, _StaleBackend()))
+    with pytest.raises(RequestFailure, match="stale turn"):
+        await ports.steer(
+            TurnSteerParams(
+                session_id="session-1",
+                expected_turn_id="turn-1",
+                message=[TextContentBlock(text="[rubber duck] hi")],
+            )
+        )
