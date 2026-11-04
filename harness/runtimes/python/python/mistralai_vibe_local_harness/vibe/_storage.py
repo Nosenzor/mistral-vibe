@@ -3822,7 +3822,12 @@ def _load_runtime_state(
     version = value.get("runtime_state_version")
     if version != _RUNTIME_STATE_VERSION:
         raise ValueError(f"unsupported Runtime state version: {version!r}")
-    return RuntimeStateV3.model_validate(value)
+    # extra="allow" applies the persisted-document rule of ``_StoredModel`` to
+    # the nested shapes, whose own configs are strict (e.g. the subagent
+    # records): a store written by a newer build must still load, and pydantic
+    # carries the unknown keys back out through ``model_dump`` on the next
+    # publication. Store protection is STORE_FORMAT_MINOR, not field strictness.
+    return RuntimeStateV3.model_validate(value, extra="allow")
 
 
 def history_fingerprint(history: list[InteropHistoryMessageV1]) -> str:
