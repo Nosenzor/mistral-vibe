@@ -515,6 +515,7 @@ def _make_server(process_services: ProcessServices) -> AppServer:
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
         ),
+        oidc_tenants=process_services.oidc_tenants,
     )
 
 
@@ -793,6 +794,7 @@ async def test_peer_review_state_dies_with_session_delete(
             HarnessFilesManager(sources=("user", "project")),
             org_config=process_services.org_config,
         ),
+        oidc_tenants=process_services.oidc_tenants,
     )
     backend = cast(SessionBackend, _FakeSessionBackend(_config()))
     await server._activate_backend(backend, 200)

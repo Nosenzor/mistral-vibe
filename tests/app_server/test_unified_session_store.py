@@ -72,9 +72,11 @@ def _runtime_state_value_with_unknown_child_field() -> dict[str, Any]:
         subagents=subagents,
     )
     value = cast(dict[str, Any], state.model_dump(mode="json"))
-    # A newer build recorded a field this build does not name.
+    # A newer build recorded fields this build does not name (in 3.1.0
+    # ``instructions`` became a declared field; a future build may add more).
     child = value["subagents"]["children"]["critical-review-mars-p1"]
     child["instructions"] = None
+    child["some_future_field"] = "x"
     return value
 
 
@@ -88,11 +90,12 @@ def test_load_runtime_state_tolerates_fields_from_newer_builds() -> None:
 def test_load_runtime_state_keeps_unknown_fields_on_the_loaded_instance() -> None:
     value = _runtime_state_value_with_unknown_child_field()
     loaded = _load_runtime_state(value, cast(ProjectionStateV1, None))
-    # The extra is kept on the instance (a model_copy advance carries it),
-    # matching the persisted-document rule of _StoredModel.
     assert loaded.subagents is not None
     child = loaded.subagents.children["critical-review-mars-p1"]
-    assert child.__pydantic_extra__ == {"instructions": None}
+    # Declared fields load normally; unknown ones are kept on the instance
+    # (a model_copy advance carries them), per the _StoredModel rule.
+    assert child.instructions is None
+    assert child.__pydantic_extra__ == {"some_future_field": "x"}
     # Document-level unknown fields round-trip through model_dump.
     value["unknown_top_level_field"] = "kept"
     loaded = _load_runtime_state(value, cast(ProjectionStateV1, None))

@@ -33,6 +33,7 @@ pub mod key {
 pub mod action {
     pub const NAVIGATE: &str = "navigate";
     pub const SELECT: &str = "select";
+    pub const ACCEPT: &str = "accept";
     pub const OPEN: &str = "open";
     pub const FULL_CHANGELOG: &str = "full changelog";
     pub const SAVE: &str = "save";
