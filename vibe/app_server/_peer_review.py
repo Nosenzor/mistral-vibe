@@ -431,6 +431,12 @@ class _SessionPeerState:
     # Per-turn budget cap, resolved when the turn arms so the idle gates never
     # touch the config.
     max_reviews: int = 0
+    # The duck model resolved from the effective config, cached when the cache
+    # was checked (at backend activation or after a configure) so the event tap
+    # never reads the config — its reads must not run on the event-stream path.
+    model_cache: ModelConfig | None = None
+    cached_max_reviews: int = 0
+    config_checked: bool = False
     scheduling: bool = False
     # A turn that completed while a review was still in flight owes its final
     # material exactly one more review, which the in-flight one hands off to.
@@ -467,6 +473,38 @@ class PeerReviewController:
         """Bind the review loop to a session's backend and workspace."""
         state = self._sessions.setdefault(session_id, _SessionPeerState())
         state.ports = ports
+
+    def has_enabled_duck(self, session_id: str) -> bool:
+        """Cheap in-memory check: may this session's events carry duck work?
+
+        The server's event fan-out consults this before queueing a tap event,
+        so with no duck configured the fan-out does no peer work at all. When
+        the cache was never checked (direct controller use), answer True and
+        let the tap resolve the config itself.
+        """
+        state = self._sessions.get(session_id)
+        if state is None:
+            return False
+        return not state.config_checked or state.model_cache is not None
+
+    async def refresh_config(self, session_id: str) -> None:
+        """Re-resolve the duck model from the effective config into the cache.
+
+        Called at backend activation (off the turn path) and after a configure.
+        Never raises: a failed read leaves the cache unchecked, and the tap
+        falls back to a live read.
+        """
+        state = self._sessions.get(session_id)
+        if state is None or state.ports is None:
+            return
+        try:
+            config = await state.ports.backend.effective_config(session_id)
+        except Exception:
+            logger.debug("Peer review could not refresh the config", exc_info=True)
+            return
+        state.model_cache = self._resolve_model(config)
+        state.cached_max_reviews = config.peer_review.max_reviews_per_turn
+        state.config_checked = True
 
     async def detach(self, session_id: str) -> None:
         """Release the session's loop ports and cancel any in-flight review."""
@@ -530,6 +568,9 @@ class PeerReviewController:
         if params.auto_steer is not None:
             state.auto_steer = params.auto_steer
         view = await self._view(params.session_id, state, ports)
+        # The configure write may have flipped the override: re-resolve the
+        # cache so the event tap sees the new duck without reading the config.
+        await self.refresh_config(params.session_id)
         await self._record(
             ports,
             PEER_EVENT_CONFIGURED,
@@ -599,7 +640,7 @@ class PeerReviewController:
         return PeerSteerResponse(accepted=True, delivered=True)
 
     async def handle_backend_event(self, envelope: SessionBackendEvent) -> None:
-        """Tap entry point, awaited inline by the server's event fan-out.
+        """Tap entry point, drained by the server's background peer worker.
 
         Never raises: a duck failure must not break the session's event stream.
         """
@@ -650,6 +691,15 @@ class PeerReviewController:
         ports = state.ports
         if ports is None:
             return
+        if state.config_checked:
+            # The tap must not read the config on the event-stream path; the
+            # cache was resolved at activation (or after a configure).
+            model = state.model_cache
+            if model is None:
+                return
+            state.max_reviews = state.cached_max_reviews
+            state.phase = _PeerPhase.ARMED
+            return
         try:
             config = await ports.backend.effective_config(session_id)
         except Exception:
@@ -657,6 +707,9 @@ class PeerReviewController:
             return
         if self._resolve_model(config) is None:
             return
+        state.model_cache = self._resolve_model(config)
+        state.config_checked = True
+        state.cached_max_reviews = config.peer_review.max_reviews_per_turn
         state.max_reviews = config.peer_review.max_reviews_per_turn
         state.phase = _PeerPhase.ARMED
 

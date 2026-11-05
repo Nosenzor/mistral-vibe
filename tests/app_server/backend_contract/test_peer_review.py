@@ -31,6 +31,9 @@ from vibe.app_server.host import AppServerHost
 from vibe.app_server.protocol import ClientCapabilities, ClientInfo, SessionOptions
 from vibe.app_server.transport import memory_transport_pair
 
+# Drives start_turn, steer_turn and write_config, whose runtime path depends on
+# the Session API switch.
+
 _DUCK_MODEL = "duck-model"
 _UTILITY_MODELS = ("mistral-vibe-cli-fast", "mistral-small-latest")
 _STEER_TEXT = "DUCK SAYS STOP 678"
@@ -78,22 +81,110 @@ def _sse(
     )
 
 
+@pytest.mark.one_path
 @pytest.mark.asyncio
-async def test_duck_mirror_sees_tool_data_and_steer_reaches_the_main_model(
+async def test_duck_mirror_sees_tool_data(
     peer_harness: Any,
     backend_contract_mistral_api: respx.Route,
     tmp_working_directory: Path,
 ) -> None:
+    """The duck's mirror carries a tool call's input and its result body.
+
+    One path only: on the Session API path the effect settles at turn end, so
+    the mirror content timing is path-dependent; the payload assertions here
+    observe the provider request, not the switch.
+    """
     harness, client, host = peer_harness
     (tmp_working_directory / "a.py").write_text(
         "FILE BODY MARKER 12345\n", encoding="utf-8"
     )
     session = await host.open_session()
-
-    configure = await client.request(
+    await client.request(
         "peer/configure", {"sessionId": session.session_id, "model": "duck"}
     )
-    assert configure["enabled"] is True
+
+    main_release = asyncio.Event()
+    state = {"main_calls": 0}
+
+    def side_effect(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        model = payload.get("model")
+        if model == _DUCK_MODEL:
+            verdict = json.dumps({
+                "severity": "info",
+                "steerable": False,
+                "text": "No concerns.",
+            })
+            return _sse(verdict)
+        if model in _UTILITY_MODELS:
+            return _sse("a title")
+        state["main_calls"] += 1
+        if state["main_calls"] == 1:
+            tool_call = {
+                "id": "call-1",
+                "index": 0,
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "a.py"}),
+                },
+            }
+            return _sse("reading the file", [tool_call])
+        return httpx.Response(
+            200,
+            stream=_GatedSSEStream(
+                _mistral_sse_payload("final answer", None),
+                asyncio.Event(),
+                main_release,
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    backend_contract_mistral_api.mock(side_effect=side_effect)
+
+    async def drive() -> None:
+        async for _event in session.act("fix the parser"):
+            pass
+
+    task = asyncio.create_task(drive())
+    loop = asyncio.get_running_loop()
+
+    def duck_user_text() -> str:
+        texts: list[str] = []
+        for call in backend_contract_mistral_api.calls:
+            payload = json.loads(call.request.content)
+            if payload.get("model") != _DUCK_MODEL:
+                continue
+            for msg in payload.get("messages", []):
+                if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                    texts.append(msg["content"])
+        return "\n".join(texts)
+
+    main_release.set()
+    await asyncio.wait_for(task, timeout=15)
+    deadline = loop.time() + 5
+    while loop.time() < deadline and "FILE BODY MARKER 12345" not in duck_user_text():
+        await asyncio.sleep(0.05)
+    duck_user = duck_user_text()
+    assert '"filePath": "a.py"' in duck_user
+    assert "FILE BODY MARKER 12345" in duck_user
+    await session.close()
+
+
+@pytest.mark.both_paths
+@pytest.mark.asyncio
+async def test_duck_steer_reaches_the_main_model(
+    peer_harness: Any,
+    backend_contract_mistral_api: respx.Route,
+    tmp_working_directory: Path,
+) -> None:
+    """A mid-turn steer is delivered into the running turn; a late steer is a
+    clean accepted=false, not an RPC error.
+    """
+    harness, client, host = peer_harness
+    session = await host.open_session()
+    await client.request(
+        "peer/configure", {"sessionId": session.session_id, "model": "duck"}
+    )
 
     main_started = asyncio.Event()
     main_release = asyncio.Event()
@@ -159,27 +250,16 @@ async def test_duck_mirror_sees_tool_data_and_steer_reaches_the_main_model(
     )
     assert steer_resp == {"accepted": True, "delivered": True}
 
-    def requests() -> list[httpx.Request]:
-        return [c.request for c in backend_contract_mistral_api.calls]
-
-    duck_raw = [
-        r.content.decode("utf-8", "replace")
-        for r in requests()
-        if json.loads(r.content).get("model") == _DUCK_MODEL
-    ]
-    # The duck's mirror carries the tool call's input and the result body.
-    assert any("filePath" in raw and "a.py" in raw for raw in duck_raw)
-    assert any("FILE BODY MARKER 12345" in raw for raw in duck_raw)
-
     main_release.set()
     await asyncio.wait_for(task, timeout=15)
 
-    main_raw = [
-        r.content.decode("utf-8", "replace")
-        for r in requests()
-        if json.loads(r.content).get("model") not in (_DUCK_MODEL, *_UTILITY_MODELS)
-    ]
-    assert any(_STEER_TEXT in raw for raw in main_raw), (
+    main_text = "\n".join(
+        json.dumps(json.loads(call.request.content).get("messages"))
+        for call in backend_contract_mistral_api.calls
+        if json.loads(call.request.content).get("model")
+        not in (_DUCK_MODEL, *_UTILITY_MODELS)
+    )
+    assert _STEER_TEXT in main_text, (
         "the steered critique never reached the main model's requests"
     )
 

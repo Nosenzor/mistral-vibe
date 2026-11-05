@@ -344,6 +344,11 @@ class AppServer:
         self._plugin_catalog_service = plugin_catalog_service
         self._imports_service = imports_service
         self._peer_review = PeerReviewController(notify=self._notify)
+        # The duck tap never runs inline in the event fan-out: events are queued
+        # (O(1)) and drained by one worker, so duck-side work cannot delay or
+        # break the session's event stream (design §7.3).
+        self._peer_review_events: asyncio.Queue[SessionBackendEvent] = asyncio.Queue()
+        self._peer_review_worker: asyncio.Task[None] | None = None
         self._oidc_tenants = oidc_tenants
         self._session_backend_host = session_backend_host_factory(self)
         if self._session_backend_host is None:
@@ -376,6 +381,7 @@ class AppServer:
         if backend is self._backend_event_backend:
             snapshot = await backend.read(params)
             self._attach_peer_review(backend, snapshot)
+            await self._peer_review.refresh_config(backend.session_id)
             return snapshot
         subscription = await backend.subscribe(params)
         previous = self._root
@@ -403,6 +409,7 @@ class AppServer:
         await self._flush_backend_events(backend)
         snapshot = subscription.snapshot
         self._attach_peer_review(backend, snapshot)
+        await self._peer_review.refresh_config(backend.session_id)
         return snapshot
 
     def _attach_peer_review(
@@ -467,9 +474,22 @@ class AppServer:
                 )
                 if runtime_updated is not None:
                     await self._route_notification("runtime/updated", runtime_updated)
-        # The rubber-duck tap: the controller never raises, so a duck failure
-        # cannot break the session's event stream (design §7.3).
-        await self._peer_review.handle_backend_event(envelope)
+        # The rubber-duck tap: queued, never awaited inline — the worker drains
+        # it, so a duck failure cannot break or delay the event stream (§7.3).
+        # With no duck configured the controller says so from an in-memory
+        # cache, and the fan-out does no peer work at all.
+        session_id = envelope.session_id
+        if session_id is not None and self._peer_review.has_enabled_duck(session_id):
+            if self._peer_review_worker is None:
+                self._peer_review_worker = asyncio.create_task(
+                    self._drain_peer_events(), name="vibe-peer-review-tap"
+                )
+            self._peer_review_events.put_nowait(envelope)
+
+    async def _drain_peer_events(self) -> None:
+        while True:
+            envelope = await self._peer_review_events.get()
+            await self._peer_review.handle_backend_event(envelope)
 
     async def _forward_connector_authorization(
         self, event: ConnectorAuthorizationRequiredEvent
@@ -698,6 +718,10 @@ class AppServer:
         self._backend_event_backend = None
         if backend_events is not None and backend_events is not current:
             tasks.append(backend_events)
+        peer_worker = self._peer_review_worker
+        self._peer_review_worker = None
+        if peer_worker is not None and peer_worker is not current:
+            tasks.append(peer_worker)
         errors = await cancel_tasks(tasks, label="app-server background")
         if isinstance(self._session_backend_host, SessionBackendHostBackgroundTasks):
             errors.extend(
@@ -716,6 +740,10 @@ class AppServer:
         self._backend_event_backend = None
         if backend_events is not None and backend_events is not current:
             tasks.append(backend_events)
+        peer_worker = self._peer_review_worker
+        self._peer_review_worker = None
+        if peer_worker is not None and peer_worker is not current:
+            tasks.append(peer_worker)
         return await cancel_tasks(tasks, label="app-server request")
 
     def _request_finished(self, task: asyncio.Task[None]) -> None:
