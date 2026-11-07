@@ -2418,7 +2418,9 @@ async def test_peer_run_completes_and_emits_a_result() -> None:
     )
     assert response.run_id == "run-1"
     state = controller._sessions["session-1"]
-    await asyncio.wait_for(state.runs["run-1"].task, timeout=5)
+    task = state.runs["run-1"].task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
 
     results = _results(notify)
     assert [r.status for r in results] == [
@@ -2454,7 +2456,9 @@ async def test_peer_agent_report_is_steerable_into_the_running_turn() -> None:
         ports,
     )
     state = controller._sessions["session-1"]
-    await asyncio.wait_for(state.runs[response.run_id].task, timeout=5)
+    task = state.runs[response.run_id].task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
     assert state.runs[response.run_id].steerable is True
 
     steer = await controller.steer(
@@ -2486,8 +2490,10 @@ async def test_peer_stop_cancels_a_running_run() -> None:
     assert stop.accepted is True
     gate.set()
     state = controller._sessions["session-1"]
+    task = state.runs[response.run_id].task
+    assert task is not None
     with suppress(asyncio.CancelledError):
-        await asyncio.wait_for(state.runs[response.run_id].task, timeout=5)
+        await asyncio.wait_for(task, timeout=5)
     assert state.runs[response.run_id].status is PeerRunStatus.CANCELLED
     assert _results(notify)[-1].status is PeerRunStatus.CANCELLED
 

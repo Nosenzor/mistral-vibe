@@ -334,6 +334,7 @@ fn config_text_reports_the_state() {
     };
     assert!(vibe_rs::commands::peer::config_text(&off).contains("off"));
     let on = PeerConfig {
+        runs: Vec::new(),
         enabled: true,
         model: Some("glm-5.3".to_owned()),
         auto_steer: false,
@@ -430,4 +431,92 @@ fn peer_command_parse_rejects_bad_usage() {
     assert!(parse("beta gamma").is_err());
     assert!(parse("beta off").is_err());
     assert!(parse("off beta").is_err());
+}
+
+#[test]
+fn run_params_parse_every_field() {
+    let parsed = peer::PeerRun::from_value(&json!({
+        "runId": "run-1",
+        "kind": "agent",
+        "prompt": "sweep of a mesh",
+        "status": "complete",
+        "steerable": true,
+        "delivered": false,
+        "text": "report",
+        "error": null,
+    }))
+    .expect("a full payload parses");
+    assert_eq!(parsed.run_id, "run-1");
+    assert_eq!(parsed.kind, peer::RunKind::Agent);
+    assert_eq!(parsed.prompt, "sweep of a mesh");
+    assert_eq!(parsed.status, peer::RunStatus::Complete);
+    assert!(parsed.steerable && !parsed.delivered);
+    assert_eq!(parsed.text, "report");
+}
+
+#[test]
+fn peer_slash_parse_handles_run_agent_stop() {
+    use vibe_rs::commands::peer::{parse, PeerArgs};
+    assert_eq!(
+        parse("run independent critical review"),
+        Ok(PeerArgs::Run {
+            prompt: "independent critical review".to_owned()
+        })
+    );
+    assert_eq!(
+        parse("agent separate research about sweep of a mesh"),
+        Ok(PeerArgs::Agent {
+            prompt: "separate research about sweep of a mesh".to_owned()
+        })
+    );
+    assert_eq!(parse("stop"), Ok(PeerArgs::Stop { run_id: None }));
+    assert_eq!(
+        parse("stop run-3"),
+        Ok(PeerArgs::Stop {
+            run_id: Some("run-3".to_owned())
+        })
+    );
+    // Bare subcommand words are usage errors, not model aliases.
+    assert!(parse("run").is_err());
+    assert!(parse("agent").is_err());
+    // Existing forms still parse.
+    assert_eq!(parse(""), Ok(PeerArgs::Read));
+    assert_eq!(
+        parse("off"),
+        Ok(PeerArgs::Configure {
+            model: None,
+            disable: true,
+            auto_steer: None
+        })
+    );
+    assert_eq!(
+        parse("beta steer on"),
+        Ok(PeerArgs::Configure {
+            model: Some("beta".to_owned()),
+            disable: false,
+            auto_steer: Some(true)
+        })
+    );
+}
+
+#[test]
+fn panel_cursor_spans_reviews_then_runs() {
+    let mut state = PeerState::default();
+    state.upsert(review("r1"));
+    state.upsert(review("r2"));
+    state.upsert_run(
+        peer::PeerRun::from_value(&json!({
+            "runId": "run-1", "kind": "run", "prompt": "p", "status": "running",
+        }))
+        .unwrap(),
+    );
+    assert_eq!(state.entry_count(), 3);
+    state.select_edge(true);
+    assert!(state.selected_run().is_some());
+    state.select_edge(false);
+    assert!(state.selected_review().is_some());
+    state.move_selection(true);
+    state.move_selection(true);
+    assert_eq!(state.selected, 2);
+    assert!(state.selected_run().is_some());
 }

@@ -144,6 +144,12 @@ pub mod method {
     pub const PEER_CONFIGURE: &str = "peer/configure";
     /// Steer one critique into the running turn (the panel's Enter action).
     pub const PEER_STEER: &str = "peer/steer";
+    /// Run a one-off task on the duck model (`/peer run <task>`).
+    pub const PEER_RUN: &str = "peer/run";
+    /// Run the duck as an independent background agent (`/peer agent <task>`).
+    pub const PEER_AGENT: &str = "peer/agent";
+    /// Cancel a running peer run or agent (`/peer stop [runId]`).
+    pub const PEER_STOP: &str = "peer/stop";
     /// The session's PR/MR artifacts (app-server `artifacts/list`).
     pub const ARTIFACTS_LIST: &str = "artifacts/list";
 }
@@ -204,6 +210,8 @@ pub mod notification {
     pub const SESSION_LEASE_ENDED: &str = "session/lease/ended";
     /// The rubber-duck peer review stream (running, then complete/failed).
     pub const PEER_REVIEW: &str = "peer/review";
+    /// A `/peer run` or `/peer agent` task's stream (running, then terminal).
+    pub const PEER_RESULT: &str = "peer/result";
     /// A session artifact (PR/MR) was detected or discovered.
     pub const ARTIFACTS_CREATED: &str = "artifacts/created";
     /// A session artifact changed (markViewed, provider sync).

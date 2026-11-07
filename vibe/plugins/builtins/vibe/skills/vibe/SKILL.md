@@ -1044,6 +1044,11 @@ session's model.
   `peer_review.auto_steer_severity` are injected into the running turn). The
   panel lists each critique with its severity; while it is focused, `Enter`
   steers the selected critique into the running turn and `d` dismisses it.
+  `/peer run <task>` asks the duck a one-off question or task (answered in the
+  panel); `/peer agent <task>` runs the duck as an independent background agent
+  on that task and its report can be steered like a critique; `/peer stop
+  [runId]` cancels a running run or agent. All three need the duck enabled
+  (`/peer <model>`) first.
 - `/thinking` - Select thinking level
 - `/theme` - Select UI theme; `auto` follows terminal/OS appearance, `mistral-dark` and `mistral-light` use the Mistral brand palette (persisted in config)
 - `/reload` - Reload configuration, agent instructions, and skills from disk (skills added or edited on disk are also picked up on their own while `file_watcher_for_autocomplete` is on, except in sandboxed sessions)

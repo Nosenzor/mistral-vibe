@@ -532,6 +532,7 @@ fn is_foreign_session_notification(app: &App, event: &Notification) -> bool {
             | notification::SESSION_SNAPSHOT
             | notification::CHILD_SESSION_UPDATED
             | notification::PEER_REVIEW
+            | notification::PEER_RESULT
             | notification::ARTIFACTS_CREATED
             | notification::ARTIFACTS_UPDATED
     ) {
@@ -894,6 +895,7 @@ pub fn apply_notification(app: &mut App, client: &Arc<Client>, event: &Notificat
         notification::TELEPORT_EVENT => crate::teleport::on_event(app, client, &event.params),
         // The rubber duck's critique stream feeds the peer panel.
         notification::PEER_REVIEW => crate::peer::apply_review(app, &event.params),
+        notification::PEER_RESULT => crate::peer::apply_result(app, &event.params),
         _ => {}
     }
     true

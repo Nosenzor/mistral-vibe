@@ -10,7 +10,7 @@ use super::super::mouse::{self, MouseTarget};
 use super::theme;
 use crate::app::App;
 use crate::hints;
-use crate::peer::{PeerReview, PeerState, ReviewStatus, Severity};
+use crate::peer::{PeerReview, PeerRun, PeerState, ReviewStatus, RunStatus, Severity};
 
 /// Below this the docked column would leave the chat too narrow to read.
 const MIN_DOCK_WIDTH: u16 = 90;
@@ -120,23 +120,33 @@ fn header_text(peer: &PeerState) -> String {
     )
 }
 
-/// The review list: status line and wrapped text per review, the cursor's
-/// review kept in view, and the row hitmap a click selects from.
+/// Which entry a painted row belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowOwner {
+    Review(usize),
+    Run(usize),
+}
+
+/// The review and run list: status line and wrapped text per entry, the
+/// cursor kept in view, and the row hitmaps a click selects from.
 fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
     if area.width < 1 || area.height < 1 {
         return;
     }
     let (rows, owners) = panel_rows(&app.peer, area.width as usize);
     let peer = &mut app.peer;
-    let selected_row = owners
-        .iter()
-        .position(|review| *review == Some(peer.selected));
+    let wanted = if peer.selected < peer.reviews.len() {
+        RowOwner::Review(peer.selected)
+    } else {
+        RowOwner::Run(peer.selected - peer.reviews.len())
+    };
+    let selected_row = owners.iter().position(|owner| *owner == Some(wanted));
     // While focused, keep the selected review inside the viewport.
     if peer.focused {
         if let Some(first) = selected_row {
             let last = owners
                 .iter()
-                .rposition(|review| *review == Some(peer.selected))
+                .rposition(|owner| *owner == Some(wanted))
                 .unwrap_or(first);
             if first < peer.scroll {
                 peer.scroll = first;
@@ -149,6 +159,7 @@ fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
     let max_scroll = rows.len().saturating_sub(area.height as usize);
     peer.scroll = peer.scroll.min(max_scroll);
     peer.hitmap.clear();
+    peer.run_hitmap.clear();
     let top = peer.scroll;
     let mut lines: Vec<Line> = Vec::new();
     for (index, line) in rows.into_iter().enumerate() {
@@ -158,16 +169,29 @@ fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
         if offset as u16 >= area.height {
             break;
         }
-        if let Some(review) = owners.get(index).copied().flatten() {
-            let screen_row = area.y + offset as u16;
-            if let Some(last) = peer.hitmap.last_mut() {
-                if last.2 == review && last.1 == screen_row {
-                    last.1 = screen_row + 1;
-                    lines.push(line);
-                    continue;
+        let screen_row = area.y + offset as u16;
+        match owners.get(index).copied().flatten() {
+            Some(RowOwner::Review(review)) => {
+                if let Some(last) = peer.hitmap.last_mut() {
+                    if last.2 == review && last.1 == screen_row {
+                        last.1 = screen_row + 1;
+                        lines.push(line);
+                        continue;
+                    }
                 }
+                peer.hitmap.push((screen_row, screen_row + 1, review));
             }
-            peer.hitmap.push((screen_row, screen_row + 1, review));
+            Some(RowOwner::Run(run)) => {
+                if let Some(last) = peer.run_hitmap.last_mut() {
+                    if last.2 == run && last.1 == screen_row {
+                        last.1 = screen_row + 1;
+                        lines.push(line);
+                        continue;
+                    }
+                }
+                peer.run_hitmap.push((screen_row, screen_row + 1, run));
+            }
+            None => {}
         }
         lines.push(line);
     }
@@ -190,11 +214,11 @@ fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
     }
 }
 
-/// The panel's rows and the review each row belongs to (`None` for blanks).
-fn panel_rows(peer: &PeerState, width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+/// The panel's rows and the entry each row belongs to (`None` for blanks).
+fn panel_rows(peer: &PeerState, width: usize) -> (Vec<Line<'static>>, Vec<Option<RowOwner>>) {
     let mut rows = Vec::new();
     let mut owners = Vec::new();
-    if peer.reviews.is_empty() {
+    if peer.reviews.is_empty() && peer.runs.is_empty() {
         rows.push(Line::from(Span::styled(
             "No reviews yet",
             theme::muted_style(),
@@ -204,7 +228,7 @@ fn panel_rows(peer: &PeerState, width: usize) -> (Vec<Line<'static>>, Vec<Option
     }
     for (index, review) in peer.reviews.iter().enumerate() {
         rows.push(status_line(review));
-        owners.push(Some(index));
+        owners.push(Some(RowOwner::Review(index)));
         let body = match review.status {
             ReviewStatus::Failed => review.error.as_deref().unwrap_or("failed"),
             _ => review.text.as_str(),
@@ -213,16 +237,67 @@ fn panel_rows(peer: &PeerState, width: usize) -> (Vec<Line<'static>>, Vec<Option
         let wrapped = crate::utils::text::wrap_hard(body, width.saturating_sub(2));
         if wrapped.is_empty() {
             rows.push(Line::default());
-            owners.push(Some(index));
+            owners.push(Some(RowOwner::Review(index)));
         }
         for line in wrapped {
             rows.push(Line::from(Span::styled(format!("  {line}"), style)));
-            owners.push(Some(index));
+            owners.push(Some(RowOwner::Review(index)));
+        }
+        rows.push(Line::default());
+        owners.push(None);
+    }
+    if !peer.runs.is_empty() {
+        rows.push(Line::from(Span::styled("Runs", theme::muted_style())));
+        owners.push(None);
+    }
+    for (index, run) in peer.runs.iter().enumerate() {
+        rows.push(run_status_line(run));
+        owners.push(Some(RowOwner::Run(index)));
+        let body = match run.status {
+            RunStatus::Failed => run.error.as_deref().unwrap_or("failed"),
+            RunStatus::Cancelled => "cancelled",
+            _ => run.text.as_str(),
+        };
+        let wrapped = crate::utils::text::wrap_hard(body, width.saturating_sub(2));
+        if wrapped.is_empty() {
+            rows.push(Line::default());
+            owners.push(Some(RowOwner::Run(index)));
+        }
+        for line in wrapped {
+            rows.push(Line::from(Span::styled(
+                format!("  {line}"),
+                theme::text(theme::foreground()),
+            )));
+            owners.push(Some(RowOwner::Run(index)));
         }
         rows.push(Line::default());
         owners.push(None);
     }
     (rows, owners)
+}
+
+/// One run's status line: kind, lifecycle glyph, delivery marker, prompt.
+fn run_status_line(run: &PeerRun) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{} {}", run.kind.label(), run.run_id),
+        theme::muted_style(),
+    )];
+    match run.status {
+        RunStatus::Running => spans.push(Span::styled("… running", theme::muted_style())),
+        RunStatus::Failed => spans.push(Span::styled("✗ failed", theme::text(theme::error()))),
+        RunStatus::Cancelled => spans.push(Span::styled("✗ cancelled", theme::muted_style())),
+        RunStatus::Complete => {
+            spans.push(Span::styled("✓ complete", theme::text(theme::success())));
+            if run.delivered {
+                spans.push(Span::styled(" · delivered", theme::text(theme::success())));
+            } else if run.steerable {
+                spans.push(Span::styled(" · steerable", theme::muted_style()));
+            }
+        }
+    }
+    let prompt = crate::utils::text::ellipsize(&run.prompt, 40);
+    spans.push(Span::styled(format!("  {prompt}"), theme::muted_style()));
+    Line::from(spans)
 }
 
 /// One review's status line: lifecycle glyph, severity, delivery marker.

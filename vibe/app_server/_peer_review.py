@@ -621,20 +621,12 @@ class PeerReviewController:
         self, params: PeerSteerParams, ports: PeerReviewPorts
     ) -> PeerSteerResponse:
         state = self._sessions.get(params.session_id)
-        review = state.reviews.get(params.review_id) if state is not None else None
         run = state.runs.get(params.review_id) if state is not None else None
-        if state is None or (review is None and run is None):
-            raise RequestFailure(
-                ProtocolErrorCode.INVALID_PARAMS,
-                f"Unknown peer review or run: '{params.review_id}'",
-            )
-        if review is not None and review.delivered:
-            return PeerSteerResponse(accepted=True, delivered=True)
-        if run is not None and run.delivered:
-            return PeerSteerResponse(accepted=True, delivered=True)
         if run is not None:
             # A direct run/agent report steers into the session's current turn.
-            if state.turn_id is None:
+            if run.delivered:
+                return PeerSteerResponse(accepted=True, delivered=True)
+            if state is None or state.turn_id is None:
                 raise RequestFailure(
                     ProtocolErrorCode.CONFLICT, "No turn is running to steer into"
                 )
@@ -646,6 +638,14 @@ class PeerReviewController:
             run.delivered = True
             state.runs[params.review_id] = run
             await self._emit_result(params.session_id, run)
+            return PeerSteerResponse(accepted=True, delivered=True)
+        review = state.reviews.get(params.review_id) if state is not None else None
+        if state is None or review is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                f"Unknown peer review or run: '{params.review_id}'",
+            )
+        if review.delivered:
             return PeerSteerResponse(accepted=True, delivered=True)
         steer_params = _steer_params(params.session_id, review.turn_id, review.text)
         try:

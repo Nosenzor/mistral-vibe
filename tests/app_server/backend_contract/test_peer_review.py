@@ -37,6 +37,7 @@ from vibe.app_server.transport import memory_transport_pair
 _DUCK_MODEL = "duck-model"
 _UTILITY_MODELS = ("mistral-vibe-cli-fast", "mistral-small-latest")
 _STEER_TEXT = "DUCK SAYS STOP 678"
+_AGENT_REPORT = "AGENT REPORT 42"
 
 
 @pytest_asyncio.fixture
@@ -271,5 +272,120 @@ async def test_duck_steer_reaches_the_main_model(
     )
     if late_rid in undelivered:
         assert late_resp == {"accepted": False, "delivered": False}
+
+    await session.close()
+
+
+@pytest.mark.both_paths
+@pytest.mark.asyncio
+async def test_peer_run_and_agent_report_flow(
+    peer_harness: Any,
+    backend_contract_mistral_api: respx.Route,
+    tmp_working_directory: Path,
+) -> None:
+    """`/peer run` answers in a peer/result; `/peer agent`'s report is steerable."""
+    harness, client, host = peer_harness
+    (tmp_working_directory / "a.py").write_text("body\n", encoding="utf-8")
+    session = await host.open_session()
+    await client.request(
+        "peer/configure", {"sessionId": session.session_id, "model": "duck"}
+    )
+
+    main_started = asyncio.Event()
+    main_release = asyncio.Event()
+    state = {"main_calls": 0}
+
+    def side_effect(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        model = payload.get("model")
+        if model == _DUCK_MODEL:
+            return _sse(_AGENT_REPORT)
+        if model in _UTILITY_MODELS:
+            return _sse("a title")
+        state["main_calls"] += 1
+        if state["main_calls"] == 1:
+            tool_call = {
+                "id": "call-1",
+                "index": 0,
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "a.py"}),
+                },
+            }
+            return _sse("reading", [tool_call])
+        main_started.set()
+        return httpx.Response(
+            200,
+            stream=_GatedSSEStream(
+                _mistral_sse_payload("final answer", None), main_started, main_release
+            ),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    backend_contract_mistral_api.mock(side_effect=side_effect)
+
+    async def drive() -> None:
+        async for _event in session.act("do the thing"):
+            pass
+
+    task = asyncio.create_task(drive())
+    loop = asyncio.get_running_loop()
+
+    # One-off run: completes and reports through peer/result.
+    run_resp = await client.request(
+        "peer/run", {"sessionId": session.session_id, "prompt": "review the plan"}
+    )
+    assert run_resp["status"] == "running"
+    run_id = run_resp["runId"]
+
+    controller = harness._server._peer_review
+
+    def run_state() -> Any:
+        return controller._sessions[session.session_id].runs.get(run_id)
+
+    deadline = loop.time() + 10
+    while run_state() is None or run_state().status.value != "complete":
+        assert loop.time() < deadline, "peer run did not complete"
+        await asyncio.sleep(0.05)
+    assert run_state().text == _AGENT_REPORT
+    assert run_state().steerable is False
+
+    # Agent: report is steerable into the running turn.
+    agent_resp = await client.request(
+        "peer/agent",
+        {"sessionId": session.session_id, "prompt": "research the mesh sweep"},
+    )
+    agent_id = agent_resp["runId"]
+
+    def agent_state() -> Any:
+        return controller._sessions[session.session_id].runs.get(agent_id)
+
+    deadline = loop.time() + 10
+    while agent_state() is None or agent_state().status.value != "complete":
+        assert loop.time() < deadline, "peer agent did not complete"
+        await asyncio.sleep(0.05)
+    assert agent_state().steerable is True
+
+    steer = await client.request(
+        "peer/steer", {"sessionId": session.session_id, "reviewId": agent_id}
+    )
+    assert steer == {"accepted": True, "delivered": True}
+
+    # peer/read lists the runs.
+    view = await client.request("peer/read", {"sessionId": session.session_id})
+    runs = {r["runId"]: r for r in view["runs"]}
+    assert runs[run_id]["kind"] == "run" and runs[run_id]["status"] == "complete"
+    assert runs[agent_id]["kind"] == "agent" and runs[agent_id]["delivered"] is True
+
+    main_release.set()
+    await asyncio.wait_for(task, timeout=15)
+
+    main_text = "\n".join(
+        json.dumps(json.loads(c.request.content).get("messages"))
+        for c in backend_contract_mistral_api.calls
+        if json.loads(c.request.content).get("model")
+        not in (_DUCK_MODEL, *_UTILITY_MODELS)
+    )
+    assert _AGENT_REPORT in main_text, "the agent report never reached the main model"
 
     await session.close()

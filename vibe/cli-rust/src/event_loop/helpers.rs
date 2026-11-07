@@ -154,6 +154,9 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
         }
         CommandEvent::PeerConfig { result, announce } => match result {
             Ok(config) => {
+                for run in &config.runs {
+                    app.peer.upsert_run(run.clone());
+                }
                 app.peer.set_config(config.clone());
                 if announce {
                     app.peer.open_unfocused();
@@ -173,6 +176,7 @@ pub(super) fn apply_command(app: &mut App, client: &Arc<Client>, command: Comman
         CommandEvent::PeerSteer { review_id, result } => match result {
             Ok(true) => {
                 app.peer.mark_delivered(&review_id);
+                app.peer.mark_run_delivered(&review_id);
                 local::add_command_result(
                     &mut app.view.transcript,
                     &id,

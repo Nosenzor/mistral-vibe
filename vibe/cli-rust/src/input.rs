@@ -304,7 +304,9 @@ fn handle_key_inner(
                 return false;
             }
             KeyCode::Char('d') if plain => {
-                app.peer.dismiss_selected();
+                if !app.peer.dismiss_selected() {
+                    crate::commands::peer::stop_selected(app, client);
+                }
                 return false;
             }
             // Esc unfocuses or closes via the ladder below.

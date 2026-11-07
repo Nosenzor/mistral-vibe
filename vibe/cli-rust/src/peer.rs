@@ -130,6 +130,7 @@ pub struct PeerConfig {
     pub auto_steer: bool,
     pub max_reviews_per_turn: u32,
     pub auto_steer_severity: Severity,
+    pub runs: Vec<PeerRun>,
 }
 
 impl PeerConfig {
@@ -156,6 +157,11 @@ impl PeerConfig {
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             ),
+            runs: value
+                .get("runs")
+                .and_then(Value::as_array)
+                .map(|runs| runs.iter().filter_map(PeerRun::from_value).collect())
+                .unwrap_or_default(),
         })
     }
 }
@@ -177,8 +183,12 @@ pub struct PeerState {
     pub config: Option<PeerConfig>,
     /// Reviews oldest-first, bounded by `MAX_REVIEWS`.
     pub reviews: VecDeque<PeerReview>,
+    /// Direct duck runs oldest-first, bounded by `MAX_RUNS`.
+    pub runs: VecDeque<PeerRun>,
     /// Row hitmap painted last frame: `(top, bottom, review index)` per review.
     pub hitmap: Vec<(u16, u16, usize)>,
+    /// Row hitmap for runs: `(top, bottom, run index)` per run row.
+    pub run_hitmap: Vec<(u16, u16, usize)>,
     /// Set once the user opens the panel; the first critique auto-docks it
     /// only before that, so a deliberate close is never overridden.
     pub opened_once: bool,
@@ -237,7 +247,7 @@ impl PeerState {
         }
         // A cursor resting on the newest review follows the feed.
         let follow =
-            self.reviews.is_empty() || self.selected >= self.reviews.len().saturating_sub(1);
+            self.entry_count() == 1 || self.selected >= self.entry_count().saturating_sub(1);
         self.reviews.push_back(review);
         if self.reviews.len() > MAX_REVIEWS {
             self.reviews.pop_front();
@@ -248,7 +258,7 @@ impl PeerState {
             }
         }
         if follow {
-            self.selected = self.reviews.len() - 1;
+            self.selected = self.entry_count() - 1;
         }
         self.clamp_selection();
     }
@@ -269,6 +279,14 @@ impl PeerState {
         self.reviews.get(self.selected)
     }
 
+    /// The selected entry as a review or a run.
+    pub fn selected_entry(&self) -> Option<SelectedEntry<'_>> {
+        if let Some(review) = self.selected_review() {
+            return Some(SelectedEntry::Review(review));
+        }
+        self.selected_run().map(SelectedEntry::Run)
+    }
+
     /// Mark a review delivered after a manual steer landed.
     pub fn mark_delivered(&mut self, review_id: &str) {
         if let Some(review) = self
@@ -280,44 +298,88 @@ impl PeerState {
         }
     }
 
-    /// `d`: drop the selected review locally; a running review has no verdict yet.
-    pub fn dismiss_selected(&mut self) {
-        let Some(review) = self.reviews.get(self.selected) else {
-            return;
-        };
-        if review.status == ReviewStatus::Running {
+    /// `d`: drop the selected entry locally when it is terminal; a running
+    /// review or run is left for the caller to stop.
+    pub fn dismiss_selected(&mut self) -> bool {
+        match self.selected_entry() {
+            Some(SelectedEntry::Review(review)) if review.status != ReviewStatus::Running => {
+                self.reviews.remove(self.selected);
+                self.clamp_selection();
+                true
+            }
+            Some(SelectedEntry::Run(run)) if run.status.is_terminal() => {
+                let index = self.selected - self.reviews.len();
+                self.runs.remove(index);
+                self.clamp_selection();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Upsert one run by id, bounded like reviews.
+    pub fn upsert_run(&mut self, run: PeerRun) {
+        if let Some(existing) = self
+            .runs
+            .iter_mut()
+            .find(|stored| stored.run_id == run.run_id)
+        {
+            *existing = run;
             return;
         }
-        self.reviews.remove(self.selected);
+        self.runs.push_back(run);
+        if self.runs.len() > MAX_RUNS {
+            self.runs.pop_front();
+            self.selected = self.selected.saturating_sub(1);
+        }
         self.clamp_selection();
     }
 
-    /// Keep the cursor on a review.
+    /// Total selectable entries: reviews first, then runs.
+    pub fn entry_count(&self) -> usize {
+        self.reviews.len() + self.runs.len()
+    }
+
+    /// The selected run, when the cursor is past the reviews.
+    pub fn selected_run(&self) -> Option<&PeerRun> {
+        self.selected
+            .checked_sub(self.reviews.len())
+            .and_then(|index| self.runs.get(index))
+    }
+
+    /// Mark a run delivered after a steer landed.
+    pub fn mark_run_delivered(&mut self, run_id: &str) {
+        if let Some(run) = self.runs.iter_mut().find(|stored| stored.run_id == run_id) {
+            run.delivered = true;
+        }
+    }
+
+    /// Keep the cursor on an entry.
     pub fn clamp_selection(&mut self) {
-        self.selected = self.selected.min(self.reviews.len().saturating_sub(1));
+        self.selected = self.selected.min(self.entry_count().saturating_sub(1));
     }
 
     /// ↑↓/jk move the cursor, wrapping at both ends (the panel is not
     /// composer-attached); PageUp/PageDown/Home/End clamp.
     pub fn move_selection(&mut self, down: bool) {
-        if self.reviews.is_empty() {
+        if self.entry_count() == 0 {
             return;
         }
-        self.selected = crate::list_nav::wrap(self.selected, self.reviews.len(), down);
+        self.selected = crate::list_nav::wrap(self.selected, self.entry_count(), down);
     }
 
     pub fn select_edge(&mut self, last: bool) {
-        self.selected = if self.reviews.is_empty() || !last {
+        self.selected = if self.entry_count() == 0 || !last {
             0
         } else {
-            self.reviews.len() - 1
+            self.entry_count() - 1
         };
     }
 
     pub fn page_selection(&mut self, down: bool, page: usize) {
         self.clamp_selection();
         if down {
-            self.selected = (self.selected + page).min(self.reviews.len().saturating_sub(1));
+            self.selected = (self.selected + page).min(self.entry_count().saturating_sub(1));
         } else {
             self.selected = self.selected.saturating_sub(page);
         }
@@ -338,17 +400,36 @@ pub fn apply_review(app: &mut App, params: &Value) {
     app.peer.upsert(review);
 }
 
+/// Reduce one `peer/result` notification into the panel's run list.
+pub fn apply_result(app: &mut App, params: &Value) {
+    let Some(run) = PeerRun::from_value(params) else {
+        return;
+    };
+    if !app.peer.open && !app.peer.opened_once {
+        app.peer.open = true;
+        app.peer.opened_once = true;
+    }
+    app.peer.upsert_run(run);
+}
+
 /// A click in the panel: focus it and select the review under the pointer.
 pub fn click_row(app: &mut App, row: u16) {
-    let Some((_, _, index)) = app
+    let review = app
         .peer
         .hitmap
         .iter()
         .find(|(top, bottom, _)| row >= *top && row < *bottom)
-    else {
+        .map(|(_, _, index)| *index);
+    let run = app
+        .peer
+        .run_hitmap
+        .iter()
+        .find(|(top, bottom, _)| row >= *top && row < *bottom)
+        .map(|(_, _, index)| app.peer.reviews.len() + *index);
+    let Some(selected) = review.or(run) else {
         return;
     };
-    app.peer.selected = *index;
+    app.peer.selected = selected;
     app.peer.focused = true;
     app.set_app_focus(false);
     crate::selection::blur_composer(app);
@@ -365,5 +446,120 @@ pub fn nav_key(app: &mut App, key: &KeyEvent) {
         KeyCode::PageUp => app.peer.page_selection(false, PAGE_STEP),
         KeyCode::PageDown => app.peer.page_selection(true, PAGE_STEP),
         _ => {}
+    }
+}
+
+/// The cursor's selected entry: a review or a run.
+#[derive(Clone, Copy, Debug)]
+pub enum SelectedEntry<'a> {
+    Review(&'a PeerReview),
+    Run(&'a PeerRun),
+}
+
+/// Runs (`/peer run` / `/peer agent`) retained in the panel, bounded like reviews.
+pub const MAX_RUNS: usize = 50;
+
+/// The run kind, parsed off the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunKind {
+    #[default]
+    Run,
+    Agent,
+}
+
+impl RunKind {
+    fn from_wire(text: &str) -> Self {
+        match text {
+            "agent" => Self::Agent,
+            _ => Self::Run,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// The run lifecycle status, parsed off the wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunStatus {
+    #[default]
+    Running,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    fn from_wire(text: &str) -> Self {
+        match text {
+            "complete" => Self::Complete,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Running,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+/// One `peer/result` notification as the panel keeps it.
+#[derive(Clone, Debug)]
+pub struct PeerRun {
+    pub run_id: String,
+    pub kind: RunKind,
+    pub prompt: String,
+    pub status: RunStatus,
+    pub steerable: bool,
+    pub delivered: bool,
+    pub text: String,
+    pub error: Option<String>,
+}
+
+impl PeerRun {
+    /// Parse the notification params; `None` when the run id is missing.
+    pub fn from_value(params: &Value) -> Option<Self> {
+        let run_id = params.get("runId")?.as_str()?.to_owned();
+        let text_of = |name: &str| {
+            params
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Some(Self {
+            run_id,
+            kind: RunKind::from_wire(
+                params
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            prompt: text_of("prompt"),
+            status: RunStatus::from_wire(
+                params
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            steerable: params
+                .get("steerable")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
+            delivered: params
+                .get("delivered")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
+            text: text_of("text"),
+            error: params
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
     }
 }

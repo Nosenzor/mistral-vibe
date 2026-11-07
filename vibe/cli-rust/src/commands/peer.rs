@@ -8,7 +8,8 @@ use crate::app::App;
 use crate::peer::{PeerConfig, ReviewStatus};
 use crate::server::{method, Client};
 
-const USAGE: &str = "Usage: /peer [model|off] [steer on|off]";
+const USAGE: &str =
+    "Usage: /peer [model|off] [steer on|off] | run <task> | agent <task> | stop [runId]";
 
 /// What `/peer` should do with its argument.
 #[derive(Debug, PartialEq)]
@@ -19,11 +20,52 @@ pub enum PeerArgs {
         disable: bool,
         auto_steer: Option<bool>,
     },
+    /// `/peer run <task>`: one-off task on the duck, answered in the panel.
+    Run {
+        prompt: String,
+    },
+    /// `/peer agent <task>`: the duck as an independent background agent.
+    Agent {
+        prompt: String,
+    },
+    /// `/peer stop [runId]`: cancel a running run or agent.
+    Stop {
+        run_id: Option<String>,
+    },
 }
 
 /// Parse the `/peer` argument: empty reads, `off` disables, a model alias
 /// enables, and `steer on|off` toggles auto-steer (alone or after a model).
 pub fn parse(arg: &str) -> Result<PeerArgs, String> {
+    // `run`, `agent` and `stop` are reserved subcommands.
+    if let Some((head, rest)) = arg.split_once(char::is_whitespace) {
+        let rest = rest.trim();
+        match head {
+            "run" if !rest.is_empty() => {
+                return Ok(PeerArgs::Run {
+                    prompt: rest.to_owned(),
+                })
+            }
+            "agent" if !rest.is_empty() => {
+                return Ok(PeerArgs::Agent {
+                    prompt: rest.to_owned(),
+                })
+            }
+            "stop" if rest.is_empty() => return Ok(PeerArgs::Stop { run_id: None }),
+            "stop" => {
+                return Ok(PeerArgs::Stop {
+                    run_id: Some(rest.to_owned()),
+                })
+            }
+            _ => {}
+        }
+    }
+    if arg == "stop" {
+        return Ok(PeerArgs::Stop { run_id: None });
+    }
+    if arg == "run" || arg == "agent" {
+        return Err(USAGE.to_owned());
+    }
     // `off` is a reserved word, valid only as the whole argument.
     if arg == "off" {
         return Ok(PeerArgs::Configure {
@@ -96,6 +138,21 @@ pub fn run(app: &mut App, client: &Arc<Client>, value: &str) {
             }
             (method::PEER_CONFIGURE, params)
         }
+        Ok(PeerArgs::Run { prompt }) => (
+            method::PEER_RUN,
+            serde_json::json!({ "sessionId": session_id, "prompt": prompt }),
+        ),
+        Ok(PeerArgs::Agent { prompt }) => (
+            method::PEER_AGENT,
+            serde_json::json!({ "sessionId": session_id, "prompt": prompt }),
+        ),
+        Ok(PeerArgs::Stop { run_id }) => (
+            method::PEER_STOP,
+            match run_id {
+                Some(run_id) => serde_json::json!({ "sessionId": session_id, "runId": run_id }),
+                None => serde_json::json!({ "sessionId": session_id }),
+            },
+        ),
         Err(usage) => {
             let _ = tx.try_send(CommandEvent::PeerConfig {
                 result: Err(usage),
@@ -104,11 +161,37 @@ pub fn run(app: &mut App, client: &Arc<Client>, value: &str) {
             return;
         }
     };
+    let is_config = matches!(request, method::PEER_READ | method::PEER_CONFIGURE);
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let result = client.request(request, params).await;
-        let _ = tx.try_send(config_event(result, true));
+        let event = if is_config {
+            config_event(result, true)
+        } else {
+            run_event(request, result)
+        };
+        let _ = tx.try_send(event);
     });
+}
+
+/// The `/peer run|agent|stop` answer: a status line; the run itself reports
+/// through the `peer/result` notification into the panel.
+fn run_event(request: &str, result: Result<serde_json::Value, anyhow::Error>) -> CommandEvent {
+    let label = match request {
+        method::PEER_RUN => "run",
+        method::PEER_AGENT => "agent",
+        _ => "stop",
+    };
+    let text = match result {
+        Ok(value) => match value.get("runId").and_then(serde_json::Value::as_str) {
+            Some(run_id) => {
+                format!("Peer {label} started as {run_id}; the result lands in the Ctrl+P panel.")
+            }
+            None => format!("Peer {label} accepted."),
+        },
+        Err(error) => return CommandEvent::Status(format!("Peer {label} failed: {error}")),
+    };
+    CommandEvent::Status(text)
 }
 
 /// The Ctrl+P toggle: open (or close) the panel, and on open read the config
@@ -149,8 +232,40 @@ fn config_event(result: Result<serde_json::Value, anyhow::Error>, announce: bool
     CommandEvent::PeerConfig { result, announce }
 }
 
-/// Enter in the focused panel: steer the selected critique into the turn.
+/// Enter in the focused panel: steer the selected critique or agent report
+/// into the turn.
 pub fn steer_selected(app: &mut App, client: &Arc<Client>) {
+    // A selected run steers its report; only finished, steerable, undelivered.
+    if let Some(run) = app.peer.selected_run() {
+        if run.status != crate::peer::RunStatus::Complete || !run.steerable || run.delivered {
+            return;
+        }
+        let run_id = run.run_id.clone();
+        let Some((session_id, tx)) = dispatch(app) else {
+            return;
+        };
+        let client = client.clone();
+        crate::work::spawn(async move {
+            let result = client
+                .request(
+                    method::PEER_STEER,
+                    serde_json::json!({ "sessionId": session_id, "reviewId": run_id }),
+                )
+                .await;
+            let result = match result {
+                Ok(value) => Ok(value
+                    .get("delivered")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_default()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.try_send(CommandEvent::PeerSteer {
+                review_id: run_id,
+                result,
+            });
+        });
+        return;
+    }
     let Some(review) = app.peer.selected_review() else {
         return;
     };
@@ -178,6 +293,34 @@ pub fn steer_selected(app: &mut App, client: &Arc<Client>) {
             Err(error) => Err(error.to_string()),
         };
         let _ = tx.try_send(CommandEvent::PeerSteer { review_id, result });
+    });
+}
+
+/// `d` on a running run in the focused panel: cancel it via `peer/stop`.
+pub fn stop_selected(app: &mut App, client: &Arc<Client>) {
+    let Some(run) = app.peer.selected_run() else {
+        return;
+    };
+    if run.status != crate::peer::RunStatus::Running {
+        return;
+    }
+    let run_id = run.run_id.clone();
+    let Some((session_id, tx)) = dispatch(app) else {
+        return;
+    };
+    let client = client.clone();
+    crate::work::spawn(async move {
+        let result = client
+            .request(
+                method::PEER_STOP,
+                serde_json::json!({ "sessionId": session_id, "runId": run_id }),
+            )
+            .await;
+        let text = match result {
+            Ok(_) => format!("Peer run {run_id} cancelled."),
+            Err(error) => format!("Failed to cancel peer run {run_id}: {error}"),
+        };
+        let _ = tx.try_send(CommandEvent::Status(text));
     });
 }
 
