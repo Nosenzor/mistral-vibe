@@ -695,10 +695,13 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
             params = validate_wire(StatsUpdatedParams, notification.params)
         case "session/childSessionUpdated":
             params = validate_wire(ChildSessionUpdatedParams, notification.params)
-        case "peer/review":
-            params = validate_wire(PeerReviewParams, notification.params)
-        case "peer/result":
-            params = validate_wire(PeerResultParams, notification.params)
+        case "peer/review" | "peer/result":
+            params = validate_wire(
+                PeerReviewParams
+                if notification.method == "peer/review"
+                else PeerResultParams,
+                notification.params,
+            )
         case "artifacts/created":
             params = validate_wire(ArtifactCreatedParams, notification.params)
         case "artifacts/updated":
