@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
+from contextlib import suppress
 import json
 from pathlib import Path
 import time
@@ -77,10 +78,15 @@ from vibe.app_server.protocol import (
     PeerConfigureParams,
     PeerConfigView,
     PeerReadParams,
+    PeerResultParams,
     PeerReviewParams,
     PeerReviewStatus,
+    PeerRunKind,
+    PeerRunParams,
+    PeerRunStatus,
     PeerSteerParams,
     PeerSteerResponse,
+    PeerStopParams,
     ProtocolErrorCode,
     SessionDeleteParams,
     SessionReadParams,
@@ -2373,3 +2379,129 @@ async def test_steer_port_translates_backend_errors_into_request_failure() -> No
                 message=[TextContentBlock(text="[rubber duck] hi")],
             )
         )
+
+
+# --- /peer run, /peer agent, /peer stop ---
+
+
+def _results(notify: _FakeNotify) -> list[PeerResultParams]:
+    return [
+        params for method, params in notify.notifications if method == "peer/result"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_peer_run_requires_an_enabled_duck() -> None:
+    backend = FakeBackend(chunks=[_verdict_chunk()])
+    controller, notify, ports, _, _ = _make_loop(_config(), backend)
+
+    with pytest.raises(RequestFailure, match="Enable the duck first"):
+        await controller.run(
+            PeerRunParams(session_id="session-1", prompt="review this"),
+            PeerRunKind.RUN,
+            ports,
+        )
+    assert _results(notify) == []
+
+
+@pytest.mark.asyncio
+async def test_peer_run_completes_and_emits_a_result() -> None:
+    backend = FakeBackend(chunks=[_verdict_chunk(text="looks fine")])
+    controller, notify, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+
+    response = await controller.run(
+        PeerRunParams(session_id="session-1", prompt="review the parser change"),
+        PeerRunKind.RUN,
+        ports,
+    )
+    assert response.run_id == "run-1"
+    state = controller._sessions["session-1"]
+    await asyncio.wait_for(state.runs["run-1"].task, timeout=5)
+
+    results = _results(notify)
+    assert [r.status for r in results] == [
+        PeerRunStatus.RUNNING,
+        PeerRunStatus.COMPLETE,
+    ]
+    assert results[-1].kind is PeerRunKind.RUN
+    assert (
+        results[-1].text
+        == '{"severity": "info", "steerable": false, "text": "looks fine"}'
+    )
+    assert results[-1].steerable is False
+
+    view = await controller.read(PeerReadParams(session_id="session-1"), ports)
+    assert [(r.run_id, r.kind, r.status) for r in view.runs] == [
+        ("run-1", PeerRunKind.RUN, PeerRunStatus.COMPLETE)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_peer_agent_report_is_steerable_into_the_running_turn() -> None:
+    backend = FakeBackend(
+        chunks=[_verdict_chunk(severity="critical", steerable=True, text="stop that")]
+    )
+    controller, notify, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+    await controller.handle_backend_event(_turn_event("turn/started", _turn()))
+
+    response = await controller.run(
+        PeerRunParams(session_id="session-1", prompt="independent critical review"),
+        PeerRunKind.AGENT,
+        ports,
+    )
+    state = controller._sessions["session-1"]
+    await asyncio.wait_for(state.runs[response.run_id].task, timeout=5)
+    assert state.runs[response.run_id].steerable is True
+
+    steer = await controller.steer(
+        PeerSteerParams(session_id="session-1", review_id=response.run_id), ports
+    )
+    assert steer == PeerSteerResponse(accepted=True, delivered=True)
+    assert "stop that" in _steered_text(ports.steered[0])
+    assert state.runs[response.run_id].delivered is True
+    # The delivered state is re-emitted so the panel updates.
+    assert _results(notify)[-1].delivered is True
+
+
+@pytest.mark.asyncio
+async def test_peer_stop_cancels_a_running_run() -> None:
+    gate = asyncio.Event()
+    backend = _GatedBackend([_verdict_chunk()], gate)
+    controller, notify, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), backend
+    )
+
+    response = await controller.run(
+        PeerRunParams(session_id="session-1", prompt="long research"),
+        PeerRunKind.AGENT,
+        ports,
+    )
+    stop = await controller.stop(
+        PeerStopParams(session_id="session-1", run_id=response.run_id), ports
+    )
+    assert stop.accepted is True
+    gate.set()
+    state = controller._sessions["session-1"]
+    with suppress(asyncio.CancelledError):
+        await asyncio.wait_for(state.runs[response.run_id].task, timeout=5)
+    assert state.runs[response.run_id].status is PeerRunStatus.CANCELLED
+    assert _results(notify)[-1].status is PeerRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_peer_stop_unknown_run_is_rejected() -> None:
+    controller, _, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}), FakeBackend()
+    )
+    with pytest.raises(RequestFailure, match="Unknown peer run"):
+        await controller.stop(
+            PeerStopParams(session_id="session-1", run_id="run-99"), ports
+        )
+
+
+def test_peer_run_methods_are_advertised() -> None:
+    assert {"peer/run", "peer/agent", "peer/stop"} <= set(SERVER_METHODS)

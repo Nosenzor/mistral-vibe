@@ -29,6 +29,7 @@ from vibe.app_server.protocol import (
     HistoryEntryUpdatedParams,
     MCPAuthRequiredParams,
     Notification,
+    PeerResultParams,
     PeerReviewParams,
     PublicSessionArtifact,
     ServerErrorParams,
@@ -269,6 +270,7 @@ def reconcile_snapshot(
 type _KnownEventParams = (
     HistoryEntryAddedParams
     | HistoryEntryUpdatedParams
+    | PeerResultParams
     | PeerReviewParams
     | SessionSnapshotParams
     | SessionCompactedParams
@@ -466,7 +468,7 @@ class ClientProjection:
             case ChildSessionUpdatedParams():
                 self._replace_child_session(params.child_session)
                 event = ChildSessionUpdated(params.child_session)
-            case PeerReviewParams():
+            case PeerReviewParams() | PeerResultParams():
                 # Transient panel notification; carries no session state.
                 event = None
             case ArtifactCreatedParams():
@@ -695,6 +697,8 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
             params = validate_wire(ChildSessionUpdatedParams, notification.params)
         case "peer/review":
             params = validate_wire(PeerReviewParams, notification.params)
+        case "peer/result":
+            params = validate_wire(PeerResultParams, notification.params)
         case "artifacts/created":
             params = validate_wire(ArtifactCreatedParams, notification.params)
         case "artifacts/updated":

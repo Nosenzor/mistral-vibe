@@ -70,10 +70,18 @@ from vibe.app_server.protocol import (
     PeerConfigureParams,
     PeerConfigView,
     PeerReadParams,
+    PeerResultParams,
     PeerReviewParams,
     PeerReviewStatus,
+    PeerRunKind,
+    PeerRunParams,
+    PeerRunResponse,
+    PeerRunStatus,
+    PeerRunView,
     PeerSteerParams,
     PeerSteerResponse,
+    PeerStopParams,
+    PeerStopResponse,
     ProtocolErrorCode,
     TurnCompletedParams,
     TurnStartedParams,
@@ -387,6 +395,22 @@ class StoredPeerReview:
     severity: PeerSeverity = PeerSeverity.INFO
 
 
+@dataclass(slots=True)
+class StoredRun:
+    """One `/peer run` or `/peer agent` request (design: direct duck tasks)."""
+
+    run_id: str
+    kind: PeerRunKind
+    prompt: str
+    status: PeerRunStatus = PeerRunStatus.RUNNING
+    text: str = ""
+    error: str | None = None
+    steerable: bool = False
+    delivered: bool = False
+    task: asyncio.Task[None] | None = None
+    transcript: list[LLMMessage] = field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class PeerVerdict:
     """The duck's structured critique, parsed from the review's final message."""
@@ -437,6 +461,10 @@ class _SessionPeerState:
     model_cache: ModelConfig | None = None
     cached_max_reviews: int = 0
     config_checked: bool = False
+    # Direct duck tasks (`/peer run`, `/peer agent`), independent of the
+    # per-turn review budget.
+    runs: dict[str, StoredRun] = field(default_factory=dict)
+    run_counter: int = 0
     scheduling: bool = False
     # A turn that completed while a review was still in flight owes its final
     # material exactly one more review, which the in-flight one hands off to.
@@ -594,12 +622,30 @@ class PeerReviewController:
     ) -> PeerSteerResponse:
         state = self._sessions.get(params.session_id)
         review = state.reviews.get(params.review_id) if state is not None else None
-        if state is None or review is None:
+        run = state.runs.get(params.review_id) if state is not None else None
+        if state is None or (review is None and run is None):
             raise RequestFailure(
                 ProtocolErrorCode.INVALID_PARAMS,
-                f"Unknown peer review: '{params.review_id}'",
+                f"Unknown peer review or run: '{params.review_id}'",
             )
-        if review.delivered:
+        if review is not None and review.delivered:
+            return PeerSteerResponse(accepted=True, delivered=True)
+        if run is not None and run.delivered:
+            return PeerSteerResponse(accepted=True, delivered=True)
+        if run is not None:
+            # A direct run/agent report steers into the session's current turn.
+            if state.turn_id is None:
+                raise RequestFailure(
+                    ProtocolErrorCode.CONFLICT, "No turn is running to steer into"
+                )
+            steer_params = _steer_params(params.session_id, state.turn_id, run.text)
+            try:
+                await ports.steer(steer_params)
+            except RequestFailure:
+                return PeerSteerResponse(accepted=False, delivered=False)
+            run.delivered = True
+            state.runs[params.review_id] = run
+            await self._emit_result(params.session_id, run)
             return PeerSteerResponse(accepted=True, delivered=True)
         steer_params = _steer_params(params.session_id, review.turn_id, review.text)
         try:
@@ -638,6 +684,115 @@ class PeerReviewController:
             if delivered_line not in state.ledger:
                 _append_ledger_line(state.ledger, delivered_line)
         return PeerSteerResponse(accepted=True, delivered=True)
+
+    async def run(
+        self, params: PeerRunParams, kind: PeerRunKind, ports: PeerReviewPorts
+    ) -> PeerRunResponse:
+        """Start a direct duck task (`/peer run` or `/peer agent`).
+
+        Runs in the background with the same read-only tool loop as reviews;
+        the result arrives as a `peer/result` notification.
+        """
+        state = self._sessions.setdefault(params.session_id, _SessionPeerState())
+        if state.ports is None:
+            raise RequestFailure(
+                ProtocolErrorCode.NOT_IMPLEMENTED,
+                "The peer review loop is not attached to this session",
+            )
+        model = state.model_cache if state.config_checked else None
+        config = await ports.effective_config(params.session_id)
+        if model is None:
+            model = self._resolve_model(config)
+            state.model_cache, state.config_checked = model, True
+        if model is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS,
+                "Enable the duck first with /peer <model>",
+            )
+        state.run_counter += 1
+        run = StoredRun(
+            run_id=f"run-{state.run_counter}",
+            kind=kind,
+            prompt=params.prompt,
+            steerable=kind is PeerRunKind.AGENT,
+        )
+        state.runs[run.run_id] = run
+        run.task = asyncio.create_task(
+            self._run_adhoc(params.session_id, state, config, model, run),
+            name=f"vibe-peer-run-{params.session_id}-{run.run_id}",
+        )
+        await self._emit_result(params.session_id, run)
+        return PeerRunResponse(run_id=run.run_id)
+
+    async def stop(
+        self, params: PeerStopParams, ports: PeerReviewPorts
+    ) -> PeerStopResponse:
+        """Cancel a running `/peer run` / `/peer agent` task."""
+        state = self._sessions.get(params.session_id)
+        run = state.runs.get(params.run_id) if state is not None else None
+        if run is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS, f"Unknown peer run: '{params.run_id}'"
+            )
+        if run.status is PeerRunStatus.RUNNING:
+            if run.task is not None:
+                run.task.cancel()
+            # Set eagerly: a task cancelled before its first step never runs
+            # its own handler, and the handler skips when already terminal.
+            run.status = PeerRunStatus.CANCELLED
+            await self._emit_result(params.session_id, run)
+        return PeerStopResponse(accepted=True)
+
+    async def _run_adhoc(
+        self,
+        session_id: str,
+        state: _SessionPeerState,
+        config: VibeConfigSchema,
+        model: ModelConfig,
+        run: StoredRun,
+    ) -> None:
+        try:
+            messages: list[LLMMessage] = list(run.transcript)
+            messages.append(LLMMessage(role=Role.user, content=run.prompt))
+            text = await self._complete_with_tools(state, config, model, messages)
+            run.transcript = messages
+            run.status = PeerRunStatus.COMPLETE
+            run.text = text.strip() or "No answer."
+        except asyncio.CancelledError:
+            if run.status is PeerRunStatus.RUNNING:
+                run.status = PeerRunStatus.CANCELLED
+                with suppress(Exception):
+                    await self._emit_result(session_id, run)
+            raise
+        except Exception as exc:
+            logger.warning("Peer run failed", exc_info=exc)
+            run.status = PeerRunStatus.FAILED
+            run.error = type(exc).__name__
+        finally:
+            run.task = None
+        with suppress(Exception):
+            await self._emit_result(session_id, run)
+
+    async def _emit_result(self, session_id: str, run: StoredRun) -> None:
+        try:
+            await self._notify(
+                "peer/result",
+                PeerResultParams(
+                    event_id=0,
+                    session_id=session_id,
+                    emitted_at=int(time.time()),
+                    run_id=run.run_id,
+                    kind=run.kind,
+                    prompt=run.prompt,
+                    status=run.status,
+                    steerable=run.steerable,
+                    delivered=run.delivered,
+                    text=run.text,
+                    error=run.error,
+                ),
+            )
+        except Exception:
+            logger.warning("Failed to emit peer result notification", exc_info=True)
 
     async def handle_backend_event(self, envelope: SessionBackendEvent) -> None:
         """Tap entry point, drained by the server's background peer worker.
@@ -1023,11 +1178,31 @@ class PeerReviewController:
             raise RuntimeError("Peer review loop is not attached to a session")
         executor = ports.tool_executor
         executor.set_policy(PeerToolPolicy.from_config(config))
-        catalog = _tool_catalog(executor.supported_tools)
         messages: list[LLMMessage] = [
             LLMMessage(role=Role.system, content=UtilityPrompt.PEER_REVIEW.read()),
             LLMMessage(role=Role.user, content=_build_context(state, mirror)),
         ]
+        content = await self._complete_with_tools(state, config, model, messages)
+        return _parse_verdict(content)
+
+    async def _complete_with_tools(
+        self,
+        state: _SessionPeerState,
+        config: VibeConfigSchema,
+        model: ModelConfig,
+        messages: list[LLMMessage],
+    ) -> str:
+        """One duck completion with a capped, serialized read-only tool loop.
+
+        Shared by the review loop and direct `/peer run` / `/peer agent` tasks.
+        Returns the final message's text.
+        """
+        ports = state.ports
+        if ports is None:
+            raise RuntimeError("Peer review loop is not attached to a session")
+        executor = ports.tool_executor
+        executor.set_policy(PeerToolPolicy.from_config(config))
+        catalog = _tool_catalog(executor.supported_tools)
         backend = self._backend_factory.backend_for(model, config)
         rounds_left = config.peer_review.max_tool_rounds
         async with backend:
@@ -1052,7 +1227,7 @@ class PeerReviewController:
                     # The final message carries the verdict; when the round cap
                     # is exhausted the last completion runs without tools so the
                     # duck still returns a verdict from gathered evidence.
-                    return _parse_verdict(message.content or "")
+                    return message.content or ""
                 rounds_left -= 1
                 messages.append(
                     LLMMessage(
@@ -1208,6 +1383,17 @@ class PeerReviewController:
             auto_steer=_effective_auto_steer(state, config),
             max_reviews_per_turn=config.peer_review.max_reviews_per_turn,
             auto_steer_severity=config.peer_review.auto_steer_severity,
+            runs=[
+                PeerRunView(
+                    run_id=run.run_id,
+                    kind=run.kind,
+                    prompt=run.prompt,
+                    status=run.status,
+                    steerable=run.steerable,
+                    delivered=run.delivered,
+                )
+                for run in sorted(state.runs.values(), key=lambda r: r.run_id)
+            ],
         )
 
 

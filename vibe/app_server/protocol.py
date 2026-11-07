@@ -169,9 +169,12 @@ SERVER_METHODS: tuple[str, ...] = (
     "mcp_catalog/remove",
     "mcp_catalog/toggle",
     "narration/summarize",
+    "peer/agent",
     "peer/configure",
     "peer/read",
+    "peer/run",
     "peer/steer",
+    "peer/stop",
     "plugin/info",
     "plugin/reload",
     "platformCredentials/headers",
@@ -3209,6 +3212,7 @@ class PeerConfigView(ProtocolModel):
     auto_steer: bool
     max_reviews_per_turn: int
     auto_steer_severity: PeerSeverity
+    runs: list[PeerRunView] = Field(default_factory=list)
 
 
 class PeerReadParams(ProtocolModel):
@@ -3223,6 +3227,63 @@ class PeerSteerParams(ProtocolModel):
 class PeerSteerResponse(ProtocolModel):
     accepted: bool
     delivered: bool
+
+
+class PeerRunKind(StrEnum):
+    RUN = auto()
+    AGENT = auto()
+
+
+class PeerRunStatus(StrEnum):
+    RUNNING = auto()
+    COMPLETE = auto()
+    FAILED = auto()
+    CANCELLED = auto()
+
+
+class PeerRunParams(ProtocolModel):
+    """``peer/run`` and ``peer/agent`` share this request shape."""
+
+    session_id: str
+    prompt: str = Field(min_length=1)
+
+
+class PeerRunResponse(ProtocolModel):
+    run_id: str
+    status: Literal["running"] = "running"
+
+
+class PeerStopParams(ProtocolModel):
+    session_id: str
+    run_id: str
+
+
+class PeerStopResponse(ProtocolModel):
+    accepted: bool
+
+
+class PeerRunView(ProtocolModel):
+    """One ``/peer run`` or ``/peer agent`` request, listed by ``peer/read``."""
+
+    run_id: str
+    kind: PeerRunKind
+    prompt: str
+    status: PeerRunStatus
+    steerable: bool = False
+    delivered: bool = False
+
+
+class PeerResultParams(EventNotificationParams):
+    """The ``peer/result`` notification, emitted running then terminal."""
+
+    run_id: str
+    kind: PeerRunKind
+    prompt: str
+    status: PeerRunStatus
+    steerable: bool = False
+    delivered: bool = False
+    text: str = ""
+    error: str | None = None
 
 
 class ArtifactCreatedParams(EventNotificationParams):

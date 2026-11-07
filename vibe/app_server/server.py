@@ -117,7 +117,10 @@ from vibe.app_server.protocol import (
     PageRequest,
     PeerConfigureParams,
     PeerReadParams,
+    PeerRunKind,
+    PeerRunParams,
     PeerSteerParams,
+    PeerStopParams,
     PlatformCredentialsInvalidatedParams,
     PlatformCredentialsResolveParams,
     PlatformCredentialsResolveResponse,
@@ -239,9 +242,12 @@ _SESSION_BACKEND_METHODS = frozenset({
     "config/reload",
     "config/model/write",
     "config/write",
+    "peer/agent",
     "peer/configure",
     "peer/read",
+    "peer/run",
     "peer/steer",
+    "peer/stop",
     "session/agent/update",
     "session/compact",
     "session/context/inject",
@@ -1500,6 +1506,18 @@ class AppServer:
         elif method == "peer/steer":
             response = await controller.steer(
                 validate_wire(PeerSteerParams, raw_params), ports
+            )
+        elif method == "peer/run":
+            response = await controller.run(
+                validate_wire(PeerRunParams, raw_params), PeerRunKind.RUN, ports
+            )
+        elif method == "peer/agent":
+            response = await controller.run(
+                validate_wire(PeerRunParams, raw_params), PeerRunKind.AGENT, ports
+            )
+        elif method == "peer/stop":
+            response = await controller.stop(
+                validate_wire(PeerStopParams, raw_params), ports
             )
         else:
             return None
