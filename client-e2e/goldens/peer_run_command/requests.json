@@ -1,0 +1,30 @@
+[
+ {
+  "method": "peer/configure",
+  "params": {
+   "model": "glm-5.3",
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "peer/run",
+  "params": {
+   "prompt": "review the parser change",
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "peer/agent",
+  "params": {
+   "prompt": "research the mesh sweep",
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ },
+ {
+  "method": "peer/stop",
+  "params": {
+   "runId": "run-1",
+   "sessionId": "00000000-0000-4000-8000-000000000001"
+  }
+ }
+]
