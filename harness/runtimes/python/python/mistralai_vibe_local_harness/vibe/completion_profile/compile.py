@@ -150,6 +150,7 @@ def compile_profile(
             model_modalities, adapter.input_modalities
         ),
         image_cost=FixedImageCost(),
+        live_steer=adapter.live_steer,
     )
     provider_format = ProviderFormat(
         wire=adapter.wire,

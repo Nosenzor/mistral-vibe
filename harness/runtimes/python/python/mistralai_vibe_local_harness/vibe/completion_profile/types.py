@@ -127,6 +127,8 @@ class ModelFacts:
     # The kinds of input the model and its adapter accept; text is always one.
     input_modalities: tuple[InputModality, ...]
     image_cost: ImageCostRule = field(default_factory=FixedImageCost)
+    # Whether the adapter can steer a streamed response that is still open.
+    live_steer: bool = False
 
     def __post_init__(self) -> None:
         _require_positive("context_window", self.context_window)
@@ -244,6 +246,7 @@ class AdapterCapabilities:
     reports_usage: bool
     structured_output: bool
     max_tokens_required: bool
+    live_steer: bool = False
 
 
 def _require_modalities(modalities: tuple[InputModality, ...]) -> None:

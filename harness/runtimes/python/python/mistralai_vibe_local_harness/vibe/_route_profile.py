@@ -73,6 +73,8 @@ def adapter_capabilities(config: LocalRuntimeAdapterConfig) -> AdapterCapabiliti
         reports_usage=True,
         structured_output=False,
         max_tokens_required=wire is WireFormat.ANTHROPIC,
+        # Only the Responses wire can steer a response that is still streaming.
+        live_steer=wire is WireFormat.OPENAI_RESPONSES,
     )
 
 
@@ -109,6 +111,7 @@ def rust_model_facts(facts: ModelFacts) -> RustModelFacts:
         compaction_threshold_max=facts.compaction_threshold_max,
         input_modalities=rust_input_modalities(facts.input_modalities),
         image_cost=RustFixedImageCostRule(tokens=facts.image_cost.tokens),
+        live_steer=facts.live_steer,
     )
 
 

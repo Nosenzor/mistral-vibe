@@ -456,6 +456,8 @@ class RustModelFacts(RustProtocolModel):
     # The kinds of input the model reads: text always, at most once each.
     input_modalities: list[RustInputModality]
     image_cost: RustImageCostRule
+    # Whether the adapter can steer a streamed response that is still open.
+    live_steer: bool = False
 
     def accepts_images(self) -> bool:
         """Whether the model reads images."""
@@ -1054,6 +1056,21 @@ class RustLLMCallAction(RustProtocolModel):
         raise ValueError("compaction LLM call trigger and turn ID do not match")
 
 
+class RustLiveSteerAction(RustProtocolModel):
+    """Steer the completion ``completion_action_id`` that is still streaming.
+
+    Core only sends this when the model facts say the adapter supports live
+    steering; the Runtime answers with a live_steer_accepted or
+    live_steer_declined event.
+    """
+
+    type: Literal["live_steer"] = "live_steer"
+    action_id: str
+    turn_id: str
+    completion_action_id: str
+    content: list[RustContentBlock] = Field(min_length=1)
+
+
 class RustRuntimeBuiltinToolCallAction(RustProtocolModel):
     type: Literal["runtime_builtin_tool_call"] = "runtime_builtin_tool_call"
     action_id: str
@@ -1171,6 +1188,7 @@ RustHookCallAction = Annotated[
 
 RustAction = (
     RustLLMCallAction
+    | RustLiveSteerAction
     | RustRuntimeBuiltinToolCallAction
     | RustProvidedToolCallAction
     | RustHookCallAction
@@ -1727,6 +1745,19 @@ class RustCompletionFailedEvent(RustProtocolModel):
     error: RustProtocolError
 
 
+class RustLiveSteerAcceptedEvent(RustProtocolModel):
+    type: Literal["live_steer_accepted"] = "live_steer_accepted"
+    action_id: str
+    turn_id: str
+
+
+class RustLiveSteerDeclinedEvent(RustProtocolModel):
+    type: Literal["live_steer_declined"] = "live_steer_declined"
+    action_id: str
+    turn_id: str
+    reason: str | None = None
+
+
 class RustPreAgentTurnContinue(RustProtocolModel):
     type: Literal["continue"] = "continue"
     user_content: list[RustContentBlock] = Field(min_length=1)
@@ -1897,6 +1928,8 @@ RustEvent = Annotated[
     | RustCompletionModelInputResyncRequestedEvent
     | RustCompletionSucceededEvent
     | RustCompletionFailedEvent
+    | RustLiveSteerAcceptedEvent
+    | RustLiveSteerDeclinedEvent
     | RustHookCompletedEvent
     | RustHookFailedEvent
     | RustToolSucceededEvent
@@ -1913,6 +1946,13 @@ class RustPendingCompletionAction(RustProtocolModel):
     type: Literal["completion"] = "completion"
     purpose: Literal["agent", "compaction"] = "agent"
     action_id: str
+
+
+class RustPendingLiveSteerAction(RustProtocolModel):
+    type: Literal["live_steer"] = "live_steer"
+    action_id: str
+    turn_id: str
+    completion_action_id: str
 
 
 class RustPendingRuntimeBuiltinToolCallAction(RustProtocolModel):
@@ -1953,6 +1993,7 @@ class RustPendingFilesystemAction(RustProtocolModel):
 
 RustPendingAction = Annotated[
     RustPendingCompletionAction
+    | RustPendingLiveSteerAction
     | RustPendingRuntimeBuiltinToolCallAction
     | RustPendingProvidedToolCallAction
     | RustPendingHookCallAction
@@ -2258,6 +2299,9 @@ __all__ = [
     "RustKnowledgeFolderDefinition",
     "RustLLMCallAction",
     "RustLargeOutputPolicy",
+    "RustLiveSteerAcceptedEvent",
+    "RustLiveSteerAction",
+    "RustLiveSteerDeclinedEvent",
     "RustLargeOutputSerializedObservation",
     "RustMessage",
     "RustModelFacts",
@@ -2281,6 +2325,7 @@ __all__ = [
     "RustOutOfOrderInputRejection",
     "RustOutputLimitRecovery",
     "RustPendingAction",
+    "RustPendingLiveSteerAction",
     "RustPendingCompletionAction",
     "RustPendingFilesystemAction",
     "RustPendingFilesystemOperation",
