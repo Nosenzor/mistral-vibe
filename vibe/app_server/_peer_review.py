@@ -1275,9 +1275,10 @@ class PeerReviewController:
             async with asyncio.timeout(timeout_seconds):
                 return await executor.execute(name, arguments)
         except TimeoutError:
-            if timeout_seconds is None:
-                return f"Error: '{name}' timed out"
-            return f"Error: '{name}' timed out after {timeout_seconds:g}s"
+            after = (
+                f" after {timeout_seconds:g}s" if timeout_seconds is not None else ""
+            )
+            return f"Error: '{name}' timed out{after}"
         except ToolError as exc:
             return f"Error: {exc}"
         except Exception as exc:
