@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, MutableMapping
+from typing import Protocol
 from contextlib import suppress
 from dataclasses import replace
 from http import HTTPStatus
@@ -211,6 +212,31 @@ class _ProvisionalDeltaEmitter:
             )
 
 
+class LiveStreamSteerer(Protocol):
+    """Sends user input into a completion stream that is still open.
+
+    A provider adapter whose transport can steer an in-progress response (the
+    Responses ``response.steer`` channel exists only on a WebSocket transport,
+    not on plain HTTP SSE) implements this for its stream. Returns whether the
+    provider accepted the input; anything else is a decline.
+    """
+
+    async def steer(self, text: str) -> bool: ...
+
+
+def create_live_steerer(
+    config: LocalRuntimeAdapterConfig, action: RustLLMCallAction
+) -> LiveStreamSteerer | None:
+    """The steerer for ``action``'s stream, or ``None`` when none can steer.
+
+    No adapter in this Runtime has a steer channel today, so this always
+    returns ``None``; an adapter with one (e.g. a WebSocket transport) returns
+    its steerer here, and Core's live_steer capability flag is what lets Core
+    emit live_steer actions at all.
+    """
+    return None
+
+
 async def execute_completion(
     action: RustLLMCallAction,
     messages: list[RustMessage],
@@ -218,6 +244,7 @@ async def execute_completion(
     config: LocalRuntimeAdapterConfig,
     retry_sink: Callable[[str, ProviderRetry | None], Awaitable[None]] | None = None,
     delta_sink: CompletionDeltaSink | None = None,
+    live_steer_registry: MutableMapping[str, LiveStreamSteerer] | None = None,
 ) -> RustCompletionSucceededEvent | RustCompletionFailedEvent:
     turn_id = action.turn_id
 
@@ -290,6 +317,13 @@ async def execute_completion(
     )
     malformed = MalformedToolCalls()
     succeeded = False
+    # Registered for the whole call so a live_steer action can reach the open
+    # stream; removed in the finally below, whatever the call returns.
+    steerer = (
+        create_live_steerer(config, action) if action.purpose == "agent" else None
+    )
+    if steerer is not None and live_steer_registry is not None:
+        live_steer_registry[action.action_id] = steerer
     try:
         if config.backend == "mistral":
             # Compaction streams too, although nothing is published from it: a
@@ -345,6 +379,8 @@ async def execute_completion(
             elapsed_s=time.perf_counter() - started,
         )
     finally:
+        if steerer is not None and live_steer_registry is not None:
+            live_steer_registry.pop(action.action_id, None)
         if emitter is not None:
             await emitter.aclose()
         _report_malformed_tool_calls(

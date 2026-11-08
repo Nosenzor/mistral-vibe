@@ -34,6 +34,9 @@ from mistralai_vibe_local_harness.protocol import (
     RustHookSkip,
     RustHookToolCall,
     RustLLMCallAction,
+    RustLiveSteerAcceptedEvent,
+    RustLiveSteerAction,
+    RustLiveSteerDeclinedEvent,
     RustMessage,
     RustModelMessageAppend,
     RustModelMessageReplace,
@@ -65,7 +68,10 @@ from mistralai_vibe_local_harness.protocol import (
     RustToolSucceededEvent,
 )
 from mistralai_vibe_local_harness.session_protocol import JsonObject
-from mistralai_vibe_local_harness.vibe._completion import execute_completion
+from mistralai_vibe_local_harness.vibe._completion import (
+    LiveStreamSteerer,
+    execute_completion,
+)
 from mistralai_vibe_local_harness.vibe._file_tools import execute_file_tool
 from mistralai_vibe_local_harness.vibe._hook_matcher import qualified_tool_name
 from mistralai_vibe_local_harness.vibe._paths import is_windows
@@ -558,6 +564,9 @@ class _LocalActionState:
             Callable[[str, ProviderRetry | None], Awaitable[None]] | None
         ) = None
         self._delta_sink: CompletionDeltaSink | None = None
+        # Steerers of completions currently streaming, keyed by completion
+        # action ID; only filled when the adapter supports live steering.
+        self._live_steerers: dict[str, LiveStreamSteerer] = {}
         self._project_roots_for: tuple[Path, ...] | None = None
         self._project_roots: list[str] = []
         self._refresh_project_roots()
@@ -729,7 +738,44 @@ class _LocalActionState:
                 ),
             )
 
+    async def _execute_live_steer(self, action: RustLiveSteerAction) -> RustEvent:
+        """Forward a steer into the in-flight completion, or decline it.
+
+        Core only sends live_steer when the adapter's model facts say it can
+        steer an open stream; with no steerer registered for the completion
+        (or a provider refusal), the answer is declined and Core falls back to
+        queueing the steer for the next completion.
+        """
+        steerer = self._live_steerers.get(action.completion_action_id)
+        if steerer is None:
+            return RustLiveSteerDeclinedEvent(
+                action_id=action.action_id,
+                turn_id=action.turn_id,
+                reason="no live stream accepts steering for this completion",
+            )
+        text = "".join(block.text for block in action.content if block.type == "text")
+        try:
+            accepted = await steerer.steer(text)
+        except Exception as exc:
+            logger.warning("Live steer failed", exc_info=True)
+            return RustLiveSteerDeclinedEvent(
+                action_id=action.action_id,
+                turn_id=action.turn_id,
+                reason=str(exc) or type(exc).__name__,
+            )
+        if accepted:
+            return RustLiveSteerAcceptedEvent(
+                action_id=action.action_id, turn_id=action.turn_id
+            )
+        return RustLiveSteerDeclinedEvent(
+            action_id=action.action_id,
+            turn_id=action.turn_id,
+            reason="provider declined the steer",
+        )
+
     async def _execute(self, action: RustAction) -> RustEvent:  # noqa: PLR0911 - one return per action kind
+        if isinstance(action, RustLiveSteerAction):
+            return await self._execute_live_steer(action)
         if isinstance(action, RustLLMCallAction):
             self._apply_model_input(action)
             return await execute_completion(
@@ -739,6 +785,7 @@ class _LocalActionState:
                 self._config,
                 retry_sink=self._retry_sink,
                 delta_sink=self._delta_sink,
+                live_steer_registry=self._live_steerers,
             )
         if (
             isinstance(action, RustProvidedToolCallAction)
@@ -1708,6 +1755,10 @@ def _unsupported_action(action: RustAction) -> RustEvent:
         return _failed_tool_action(action, code=error.code, message=error.message)
     if isinstance(action, RustFilesystemAction):
         return RustFilesystemFailedEvent(action_id=action.action_id, error=error)
+    if isinstance(action, RustLiveSteerAction):
+        return RustLiveSteerDeclinedEvent(
+            action_id=action.action_id, turn_id=action.turn_id, reason=error.message
+        )
     raise TypeError(f"Unsupported action type: {type(action).__name__}")
 
 

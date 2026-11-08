@@ -73,8 +73,12 @@ def adapter_capabilities(config: LocalRuntimeAdapterConfig) -> AdapterCapabiliti
         reports_usage=True,
         structured_output=False,
         max_tokens_required=wire is WireFormat.ANTHROPIC,
-        # Only the Responses wire can steer a response that is still streaming.
-        live_steer=wire is WireFormat.OPENAI_RESPONSES,
+        # No adapter here can steer a response that is still streaming: the
+        # Responses steer channel (``response.steer``) exists only on the
+        # Codex WebSocket transport, not on plain HTTP SSE. An adapter with a
+        # real steer channel sets this true and registers a steerer for the
+        # in-flight completion; Core then emits live_steer actions.
+        live_steer=False,
     )
 
 

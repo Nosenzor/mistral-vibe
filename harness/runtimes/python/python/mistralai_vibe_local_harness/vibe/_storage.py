@@ -550,6 +550,7 @@ _RELEASABLE_ACTION_KINDS: frozenset[str] = frozenset({
     "callback",
     "child",
     "filesystem",
+    "live_steer",
 })
 """Kinds ``_release_settled_actions`` may drop once settled and released by Core.
 
@@ -570,7 +571,14 @@ publication.
 class RuntimeActionV1(_StoredModel):
     action_id: str
     kind: Literal[
-        "completion", "tool", "hook", "process", "callback", "child", "filesystem"
+        "completion",
+        "tool",
+        "hook",
+        "process",
+        "callback",
+        "child",
+        "filesystem",
+        "live_steer",
     ]
     state: Literal["pending", "running", "succeeded", "failed"]
     request_sha256: Sha256
@@ -1537,7 +1545,14 @@ class CoreInputPayloadV1(_StoredModel):
 class ActionIntentPayloadV1(_StoredModel):
     action_id: str
     kind: Literal[
-        "completion", "tool", "hook", "process", "callback", "child", "filesystem"
+        "completion",
+        "tool",
+        "hook",
+        "process",
+        "callback",
+        "child",
+        "filesystem",
+        "live_steer",
     ]
     request_sha256: Sha256
     request: JsonValue
@@ -3490,7 +3505,14 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
         *,
         action_id: str,
         kind: Literal[
-            "completion", "tool", "hook", "process", "callback", "child", "filesystem"
+            "completion",
+            "tool",
+            "hook",
+            "process",
+            "callback",
+            "child",
+            "filesystem",
+            "live_steer",
         ],
         request: JsonValue,
         recovery_mode: Literal[

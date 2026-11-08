@@ -1337,6 +1337,18 @@ class RustTurnSteeredObservation(RustProtocolModel):
     content: list[RustContentBlock] = Field(min_length=1)
 
 
+class RustLiveSteerAcceptedObservation(RustProtocolModel):
+    type: Literal["live_steer_accepted"] = "live_steer_accepted"
+    turn_id: str
+    content: list[RustContentBlock] = Field(min_length=1)
+
+
+class RustLiveSteerDeclinedObservation(RustProtocolModel):
+    type: Literal["live_steer_declined"] = "live_steer_declined"
+    turn_id: str
+    content: list[RustContentBlock] = Field(min_length=1)
+
+
 class RustNotificationDeliveredObservation(RustProtocolModel):
     type: Literal["notification_delivered"] = "notification_delivered"
     turn_id: str
@@ -1482,6 +1494,8 @@ RustObservation = Annotated[
     RustTurnStartedObservation
     | RustTurnSteeringReceivedObservation
     | RustTurnSteeredObservation
+    | RustLiveSteerAcceptedObservation
+    | RustLiveSteerDeclinedObservation
     | RustNotificationReceivedObservation
     | RustNotificationDeliveredObservation
     | RustToolExecutionStartedObservation
@@ -2416,6 +2430,8 @@ __all__ = [
     "RustTurnInterruptedObservation",
     "RustTurnSettings",
     "RustTurnStartedObservation",
+    "RustLiveSteerAcceptedObservation",
+    "RustLiveSteerDeclinedObservation",
     "RustTurnSteeredObservation",
     "RustTurnSteeringReceivedObservation",
     "RustTurnStopReason",

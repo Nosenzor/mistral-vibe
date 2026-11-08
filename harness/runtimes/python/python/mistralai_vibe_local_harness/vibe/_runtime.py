@@ -51,9 +51,12 @@ from mistralai_vibe_local_harness.protocol import (
     RustInvalidStateRejection,
     RustKeepActionDirective,
     RustLLMCallAction,
+    RustLiveSteerAction,
+    RustLiveSteerDeclinedEvent,
     RustNotificationEvent,
     RustPendingAction,
     RustPendingCompletionAction,
+    RustPendingLiveSteerAction,
     RustPendingFilesystemAction,
     RustPendingHookCallAction,
     RustPluginContextDefinition,
@@ -5075,10 +5078,19 @@ class _RestoredActions:
 def _action_kind(
     action: RustAction,
 ) -> Literal[
-    "completion", "tool", "hook", "process", "callback", "child", "filesystem"
+    "completion",
+    "tool",
+    "hook",
+    "process",
+    "callback",
+    "child",
+    "filesystem",
+    "live_steer",
 ]:
     if isinstance(action, RustLLMCallAction):
         return "completion"
+    if isinstance(action, RustLiveSteerAction):
+        return "live_steer"
     if isinstance(action, RustHookCallActionBase):
         return "hook"
     if isinstance(action, RustFilesystemAction):
@@ -5098,6 +5110,10 @@ def _recovery_mode(action: RustAction) -> RecoveryMode:
     if kind == "completion":
         return "reconnect_or_fail"
     if kind in {"process", "child"}:
+        return "reconcile"
+    if kind == "live_steer":
+        # The stream is gone after an interruption; re-executing declines the
+        # steer and Core falls back to the deferred path.
         return "reconcile"
     if kind == "filesystem":
         return "idempotent_retry"
@@ -5146,6 +5162,10 @@ def _failed_action_event(action: RustAction, reason: str | Exception) -> RustEve
         )
     if isinstance(action, RustFilesystemAction):
         return RustFilesystemFailedEvent(action_id=action.action_id, error=error)
+    if isinstance(action, RustLiveSteerAction):
+        return RustLiveSteerDeclinedEvent(
+            action_id=action.action_id, turn_id=action.turn_id, reason=message
+        )
     raise TypeError(f"Unsupported action type: {type(action).__name__}")
 
 
@@ -5227,6 +5247,11 @@ def _unstarted_action_failure(pending: RustPendingAction) -> RustEvent | None:
     )
     if isinstance(pending, RustPendingCompletionAction):
         return None
+    if isinstance(pending, RustPendingLiveSteerAction):
+        # Its stream is gone; declining lets Core fall back to the deferred steer.
+        return RustLiveSteerDeclinedEvent(
+            action_id=pending.action_id, turn_id=pending.turn_id, reason=error.message
+        )
     if isinstance(pending, RustPendingHookCallAction):
         return RustHookFailedEvent(action_id=pending.action_id, error=error)
     if isinstance(pending, RustPendingFilesystemAction):
