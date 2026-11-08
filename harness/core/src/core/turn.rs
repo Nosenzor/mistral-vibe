@@ -27,7 +27,7 @@ use crate::core::features::permissions::{ApprovalFailureReason, ApprovalOutcome}
 use crate::core::hooks::{HookCall, HookPoint, HookResult};
 use crate::core::state::hook_binding_ids;
 use crate::core::state::{
-    ActivePhase, ActiveTurn, HarnessState, InterruptionResolution, TurnState,
+    ActivePhase, ActiveTurn, HarnessState, InterruptionResolution, PendingLiveSteer, TurnState,
 };
 use crate::core::step_protocol::Action;
 use crate::core::step_protocol::DeterminismContext;
@@ -87,6 +87,17 @@ pub(crate) enum TurnEvent {
     Filesystem {
         action_id: String,
         result: Result<FilesystemResult, ProtocolError>,
+    },
+    LiveSteerAccepted {
+        action_id: String,
+        turn_id: String,
+        content: Vec<ContentBlock>,
+    },
+    LiveSteerDeclined {
+        action_id: String,
+        turn_id: String,
+        content: Vec<ContentBlock>,
+        reason: Option<String>,
     },
 }
 
@@ -178,6 +189,17 @@ pub(crate) fn dispatch(
         TurnEvent::Filesystem { action_id, result } => {
             finish_pending_filesystem(state, action_id, result)
         }
+        TurnEvent::LiveSteerAccepted {
+            action_id,
+            turn_id,
+            content,
+        } => resolve_live_steer_accepted(state, action_id, turn_id, content),
+        TurnEvent::LiveSteerDeclined {
+            action_id,
+            turn_id,
+            content,
+            reason,
+        } => resolve_live_steer_declined(state, action_id, turn_id, content, reason),
     }
 }
 
@@ -795,9 +817,37 @@ fn handle_user_message(
             let mut outcome = Outcome::quiet();
             outcome.observe(Observation::TurnSteeringReceived {
                 turn_id: turn_id.clone(),
-                content: observed_content,
+                content: observed_content.clone(),
             });
-            state.require_active_mut()?.defer_steer(message)?;
+            let live_steer = state.config.settings.context.model_facts.live_steer;
+            let active = state.require_active_mut()?;
+            if live_steer {
+                if let ActivePhase::AwaitingCompletion {
+                    action_id: completion_action_id,
+                } = &active.phase
+                {
+                    let completion_action_id = completion_action_id.clone();
+                    let effect_id = crate::core::action_id::live_steer(
+                        &turn_id,
+                        &completion_action_id,
+                        u64::from(active.live_steer_count),
+                    );
+                    active.live_steer_count += 1;
+                    active.pending_live_steer.push(PendingLiveSteer {
+                        action_id: effect_id.clone(),
+                        completion_action_id: completion_action_id.clone(),
+                        content: observed_content.clone(),
+                    });
+                    outcome.absorb(Outcome::action(Action::LiveSteer {
+                        effect_id,
+                        turn_id,
+                        completion_action_id,
+                        content: observed_content,
+                    }));
+                    return Ok(outcome);
+                }
+            }
+            active.defer_steer(message)?;
             Ok(outcome)
         }
     }
@@ -926,6 +976,8 @@ fn start_turn(
             iterations: 0,
             phase: ActivePhase::AwaitingHook { pending },
             pending_steer: Vec::new(),
+            pending_live_steer: Vec::new(),
+            live_steer_count: 0,
             model_input_ready: false,
             output_limit_retries: 0,
         });
@@ -982,6 +1034,8 @@ fn commit_turn(
         iterations: 0,
         phase,
         pending_steer: Vec::new(),
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: true,
         output_limit_retries: 0,
     });
@@ -1082,6 +1136,76 @@ fn abandon_turn(
             cause: abandoned_cause,
         });
     }
+    Ok(outcome)
+}
+
+/// Take the pending live steer `action_id` out of the active turn, checking the
+/// turn it belongs to. The Runtime only answers an action Core handed out, so a
+/// miss is a correlation error, not a state error.
+fn take_pending_live_steer(
+    state: &mut HarnessState,
+    action_id: &str,
+    turn_id: &str,
+) -> Result<PendingLiveSteer, CoreError> {
+    require_active_turn_id(state, turn_id, "live steer")?;
+    let active = state.require_active_mut()?;
+    let position = active
+        .pending_live_steer
+        .iter()
+        .position(|steer| steer.action_id == action_id)
+        .ok_or_else(|| {
+            CoreError::invalid_correlation(
+                action_id,
+                active
+                    .pending_live_steer
+                    .iter()
+                    .map(|steer| steer.action_id.clone())
+                    .collect(),
+            )
+        })?;
+    Ok(active.pending_live_steer.remove(position))
+}
+
+fn resolve_live_steer_accepted(
+    state: &mut HarnessState,
+    action_id: String,
+    turn_id: String,
+    content: Vec<ContentBlock>,
+) -> Result<Outcome, CoreError> {
+    let steer = take_pending_live_steer(state, &action_id, &turn_id)?;
+    debug_assert_eq!(steer.content, content);
+    let mut outcome = Outcome::quiet();
+    outcome.observe(Observation::LiveSteerAccepted {
+        turn_id: turn_id.clone(),
+        content: content.clone(),
+    });
+    // The provider consumed the steer into the in-flight completion: record it
+    // in the turn context so the next completion sees it too.
+    state
+        .context
+        .push_in_current_turn(StoredMessage::visible(Message::user(content)));
+    Ok(outcome)
+}
+
+fn resolve_live_steer_declined(
+    state: &mut HarnessState,
+    action_id: String,
+    turn_id: String,
+    content: Vec<ContentBlock>,
+    _reason: Option<String>,
+) -> Result<Outcome, CoreError> {
+    let steer = take_pending_live_steer(state, &action_id, &turn_id)?;
+    debug_assert_eq!(steer.content, content);
+    let mut outcome = Outcome::quiet();
+    outcome.observe(Observation::LiveSteerDeclined {
+        turn_id: turn_id.clone(),
+        content: content.clone(),
+    });
+    // The provider could not take it: fall back to queueing it for the next
+    // completion, exactly like a steer on an adapter without live steering.
+    state
+        .require_active_mut()?
+        .defer_steer(StoredMessage::visible(Message::user(content)))?;
     Ok(outcome)
 }
 

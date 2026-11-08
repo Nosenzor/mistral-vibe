@@ -9,6 +9,7 @@ use crate::core::hooks::HookCall;
 use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, ProvidedToolCall, RuntimeBuiltinToolCall,
 };
+use crate::core::wire::content::ContentBlock;
 use crate::core::wire::message::Message;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
@@ -156,6 +157,18 @@ pub(crate) enum Action {
         turn_id: String,
         operation: FilesystemOperation,
     },
+    /// Steer the completion `completion_action_id` that is still in flight.
+    /// Core only emits this when the model facts say the adapter supports live
+    /// steering; the Runtime answers with a live_steer_accepted or
+    /// live_steer_declined command.
+    #[serde(rename = "live_steer")]
+    LiveSteer {
+        #[serde(rename = "action_id")]
+        effect_id: String,
+        turn_id: String,
+        completion_action_id: String,
+        content: Vec<ContentBlock>,
+    },
 }
 
 impl Action {
@@ -166,7 +179,8 @@ impl Action {
             | Self::RuntimeBuiltinTool { effect_id, .. }
             | Self::ProvidedTool { effect_id, .. }
             | Self::Hook { effect_id, .. }
-            | Self::Filesystem { effect_id, .. } => effect_id,
+            | Self::Filesystem { effect_id, .. }
+            | Self::LiveSteer { effect_id, .. } => effect_id,
         }
     }
 

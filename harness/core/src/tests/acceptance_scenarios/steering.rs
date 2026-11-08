@@ -554,3 +554,250 @@ fn steering_while_pre_llm_hook_is_running_reaches_the_next_completion() {
         ],
     );
 }
+
+fn config_with_live_steer() -> HarnessConfig {
+    let mut value = serde_json::to_value(config()).expect("base config serializes");
+    value["settings"]["context"]["model_facts"]["live_steer"] = json!(true);
+    serde_json::from_value(value).expect("live-steer config deserializes")
+}
+
+fn live_steer_action(completion_action: &Value, turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "live_steer",
+        "turn_id": turn_id,
+        "completion_action_id": action_id(completion_action),
+        "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn live_steer_accepted_command(action: &Value, turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "live_steer_accepted",
+        "action_id": action_id(action),
+        "turn_id": turn_id,
+        "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn live_steer_declined_command(action: &Value, turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "live_steer_declined",
+        "action_id": action_id(action),
+        "turn_id": turn_id,
+        "content": [{"type": "text", "text": text}],
+        "reason": "provider cannot steer this stream",
+    })
+}
+
+fn live_steer_accepted_observation(turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "live_steer_accepted",
+        "turn_id": turn_id,
+        "content": [{"type": "text", "text": text}],
+    })
+}
+
+fn live_steer_declined_observation(turn_id: &str, text: &str) -> Value {
+    json!({
+        "type": "live_steer_declined",
+        "turn_id": turn_id,
+        "content": [{"type": "text", "text": text}],
+    })
+}
+
+///
+/// *Prepare*: A turn has one model completion in flight and the adapter reports
+/// `live_steer`.
+/// *Do*: Steer before that completion returns, the Runtime accepts, then the
+/// retained completion finishes.
+/// *Assert*: Core dispatches a `live_steer` action for the in-flight completion,
+/// records the accepted steer in the turn context before the assistant message,
+/// and continues the same turn with one new completion.
+///
+#[test]
+fn live_steering_accepted_enters_the_turn_context_before_the_assistant_message() {
+    // Prepare
+    let turn_id = "turn-live-steer-accepted";
+    let mut runtime = SynchronousRuntime::new(config_with_live_steer());
+    let original_completion = runtime.start_turn(turn_id, "first direction");
+
+    // Do
+    let steer_action = runtime
+        .apply(
+            user_message(turn_id, "changed direction", "steer"),
+            running(turn_id)
+                .keep(&original_completion)
+                .dispatch(live_steer_action(
+                    &original_completion,
+                    turn_id,
+                    "changed direction",
+                ))
+                .observe(turn_steering_received(turn_id, "changed direction")),
+        )
+        .only_action();
+    runtime.restart_from_checkpoint();
+    runtime.apply(
+        live_steer_accepted_command(&steer_action, turn_id, "changed direction"),
+        running(turn_id)
+            .keep(&original_completion)
+            .observe(live_steer_accepted_observation(turn_id, "changed direction")),
+    );
+    // The provider already consumed the steer, so the in-flight completion keeps
+    // running; make it call a tool so the turn continues and the follow-up input
+    // shows where the accepted steer landed in the context.
+    let calls = vec![tool_call("live-steer-call", "read_file", json!({"path": "a.txt"}))];
+    let tool_actions = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &original_completion,
+            &calls,
+            [runtime_tool(
+                "file_system.read_file",
+                json!({"path": "a.txt"}),
+            )],
+        )
+        .actions();
+    let [tool_action]: [Value; 1] = tool_actions
+        .try_into()
+        .expect("one tool is running");
+    let tool_result = text_tool_success(&tool_action, "a contents");
+    let follow_up_completion = runtime
+        .apply(
+            tool_result.clone(),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe_completed_tool_result(&tool_action, &tool_result),
+        )
+        .only_action();
+    runtime.assert_last_model_message_update(
+        &follow_up_completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("first direction"),
+            model_user_text("changed direction"),
+            model_assistant_tool_calls(&calls),
+            model_tool_text("live-steer-call", "read_file", "a contents"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &follow_up_completion, "final answer");
+}
+
+///
+/// *Prepare*: A turn has one model completion in flight and the adapter reports
+/// `live_steer`, but the Runtime declines the steer.
+/// *Do*: Steer, decline, then finish the retained completion.
+/// *Assert*: Core falls back to the deferred path: the steer lands after the
+/// committed assistant message in the follow-up completion's input.
+///
+#[test]
+fn live_steering_declined_falls_back_to_the_deferred_steer() {
+    // Prepare
+    let turn_id = "turn-live-steer-declined";
+    let mut runtime = SynchronousRuntime::new(config_with_live_steer());
+    let original_completion = runtime.start_turn(turn_id, "first direction");
+
+    // Do
+    let steer_action = runtime
+        .apply(
+            user_message(turn_id, "changed direction", "steer"),
+            running(turn_id)
+                .keep(&original_completion)
+                .dispatch(live_steer_action(
+                    &original_completion,
+                    turn_id,
+                    "changed direction",
+                ))
+                .observe(turn_steering_received(turn_id, "changed direction")),
+        )
+        .only_action();
+    runtime.apply(
+        live_steer_declined_command(&steer_action, turn_id, "changed direction"),
+        running(turn_id)
+            .keep(&original_completion)
+            .observe(live_steer_declined_observation(turn_id, "changed direction")),
+    );
+    runtime.restart_from_checkpoint();
+    let follow_up_completion = runtime
+        .apply(
+            text_completion(&original_completion, "answer before steering"),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(assistant_text_committed(
+                    turn_id,
+                    &original_completion,
+                    "answer before steering",
+                ))
+                .observe(turn_steered(turn_id, "changed direction")),
+        )
+        .only_action();
+    runtime.assert_last_model_message_update(
+        &follow_up_completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("first direction"),
+            model_assistant_text("answer before steering"),
+            model_user_text("changed direction"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &follow_up_completion, "changed answer");
+}
+
+///
+/// *Prepare*: The adapter reports `live_steer`, but the turn is waiting on a
+/// tool batch, not a completion.
+/// *Do*: Steer while the tools run.
+/// *Assert*: No `live_steer` action is dispatched; the steer is deferred exactly
+/// like on an adapter without live steering.
+///
+#[test]
+fn live_steering_is_not_dispatched_while_tools_are_running() {
+    // Prepare
+    let turn_id = "turn-live-steer-tools";
+    let mut runtime = SynchronousRuntime::new(config_with_live_steer());
+    let original_completion = runtime.start_turn(turn_id, "read a file");
+    let calls = vec![tool_call("steer-tool-a", "read_file", json!({"path": "a.txt"}))];
+    let tool_actions = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &original_completion,
+            &calls,
+            [runtime_tool(
+                "file_system.read_file",
+                json!({"path": "a.txt"}),
+            )],
+        )
+        .actions();
+    let [tool_action]: [Value; 1] = tool_actions
+        .try_into()
+        .expect("one tool is running");
+
+    // Do: steer while the tool batch is in flight; nothing is dispatched.
+    runtime.receive_steering(turn_id, "changed direction", &[&tool_action]);
+    runtime.restart_from_checkpoint();
+
+    // Assert: the deferred steer reaches the next completion after the tool result.
+    let tool_result = text_tool_success(&tool_action, "a contents");
+    let follow_up_completion = runtime
+        .apply(
+            tool_result.clone(),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe_completed_tool_result(&tool_action, &tool_result)
+                .observe(turn_steered(turn_id, "changed direction")),
+        )
+        .only_action();
+    runtime.assert_last_model_message_update(
+        &follow_up_completion,
+        "replace",
+        &[
+            model_system(),
+            model_user_text("read a file"),
+            model_assistant_tool_calls(&calls),
+            model_tool_text("steer-tool-a", "read_file", "a contents"),
+            model_user_text("changed direction"),
+        ],
+    );
+    runtime.finish_turn_with_text(turn_id, &follow_up_completion, "final answer");
+}

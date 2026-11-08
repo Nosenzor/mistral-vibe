@@ -159,6 +159,12 @@ pub(crate) struct ModelFacts {
     /// The kinds of input the model reads. Text is always one of them.
     pub input_modalities: Vec<InputModality>,
     pub image_cost: ImageCostRule,
+    /// Whether the provider adapter can steer a completion that is still
+    /// streaming; when true, Core forwards mid-turn steering into the in-flight
+    /// completion instead of queueing it for the next one. Defaults to false
+    /// so a host from before this field existed still loads.
+    #[serde(default)]
+    pub live_steer: bool,
 }
 
 /// A kind of input a model reads.
@@ -679,6 +685,7 @@ mod tests {
                 "compaction_threshold_max": 238_144,
                 "input_modalities": ["text", "image"],
                 "image_cost": { "kind": "fixed", "tokens": 8_192 },
+                "live_steer": false,
             })
         );
         assert_eq!(

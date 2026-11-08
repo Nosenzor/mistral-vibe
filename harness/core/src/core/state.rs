@@ -230,13 +230,24 @@ impl HarnessState {
                 0,
             )],
             TurnState::Active(active) => match &active.phase {
-                ActivePhase::AwaitingCompletion { action_id } => vec![completion_action(
-                    self,
-                    action_id.clone(),
-                    Some(active.turn_id.clone()),
-                    CompletionActionKind::Agent,
-                    active.iterations,
-                )],
+                ActivePhase::AwaitingCompletion { action_id } => {
+                    let mut actions = vec![completion_action(
+                        self,
+                        action_id.clone(),
+                        Some(active.turn_id.clone()),
+                        CompletionActionKind::Agent,
+                        active.iterations,
+                    )];
+                    actions.extend(active.pending_live_steer.iter().map(|steer| {
+                        Action::LiveSteer {
+                            effect_id: steer.action_id.clone(),
+                            turn_id: active.turn_id.clone(),
+                            completion_action_id: steer.completion_action_id.clone(),
+                            content: steer.content.clone(),
+                        }
+                    }));
+                    actions
+                }
                 ActivePhase::AwaitingCompaction { pending } => vec![completion_action(
                     self,
                     pending.action_id().to_string(),
@@ -317,6 +328,7 @@ impl HarnessState {
                 | Action::Hook { .. }
                 | Action::RuntimeBuiltinTool { .. }
                 | Action::ProvidedTool { .. }
+                | Action::LiveSteer { .. }
                 | Action::Filesystem { .. } => None,
             })
     }
@@ -379,6 +391,16 @@ impl HarnessState {
                         }
                     },
                     action_id: effect_id,
+                },
+                Action::LiveSteer {
+                    effect_id,
+                    turn_id,
+                    completion_action_id,
+                    ..
+                } => PendingActionInspection::LiveSteer {
+                    action_id: effect_id,
+                    turn_id,
+                    completion_action_id,
                 },
                 Action::RuntimeBuiltinTool {
                     effect_id,
@@ -553,6 +575,12 @@ pub(crate) struct ActiveTurn {
     pub phase: ActivePhase,
     /// Steering accepted for this turn but not yet included in a model Action.
     pub pending_steer: Vec<StoredMessage>,
+    /// Live steers handed to the Runtime for the in-flight completion, each
+    /// awaiting its live_steer_accepted / live_steer_declined command.
+    pub pending_live_steer: Vec<PendingLiveSteer>,
+    /// Live steers issued this turn so far; keeps derived action IDs unique even
+    /// after an earlier live steer was resolved.
+    pub live_steer_count: u32,
     /// A model-valid assistant or tool-result boundary has been committed, so
     /// pending steering and notifications may be included in the next agent
     /// completion Action.
@@ -560,6 +588,15 @@ pub(crate) struct ActiveTurn {
     /// Agent completions this turn discarded because they reached the output
     /// token limit; bounded by `settings.turn.output_limit_recovery`.
     pub output_limit_retries: u32,
+}
+
+/// A steer forwarded into the in-flight completion, awaiting the Runtime's
+/// accepted/declined answer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingLiveSteer {
+    pub action_id: String,
+    pub completion_action_id: String,
+    pub content: Vec<crate::core::wire::content::ContentBlock>,
 }
 
 /// What the Runtime is currently waiting on for the active turn.

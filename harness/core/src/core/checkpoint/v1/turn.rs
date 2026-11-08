@@ -7,11 +7,11 @@ use crate::core::features::compaction::{
 };
 use crate::core::hooks::{HookPoint, hook_action_id};
 use crate::core::model_context::ModelContext;
-use crate::core::state::{ActivePhase, ActiveTurn, TurnState};
+use crate::core::state::{ActivePhase, ActiveTurn, PendingLiveSteer, TurnState};
 use crate::core::step_protocol::ToolDefinition;
 use crate::core::turn::{PendingLifecycleHook, TurnOutcome};
 use crate::core::wire::content::{ContentBlock, validate_non_empty_content};
-use crate::core::wire::message::StoredMessage;
+use crate::core::wire::message::{Message, StoredMessage};
 
 use super::context::CheckpointStoredMessage;
 use super::schema::{CheckpointCompletionCandidate, CheckpointProtocolError};
@@ -46,6 +46,10 @@ enum CheckpointTurnStateRepr {
         /// Retained for V1 compatibility; new checkpoints always write Empty.
         queued: CheckpointQueuedTurn,
         pending_steer: Vec<CheckpointStoredMessage>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_live_steer: Vec<CheckpointPendingLiveSteer>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        live_steer_count: u32,
         model_input_ready: bool,
         #[serde(default, skip_serializing_if = "is_zero")]
         output_limit_retries: u32,
@@ -83,6 +87,8 @@ impl CheckpointTurnState {
                     )?,
                     queued: CheckpointQueuedTurn::Empty,
                     pending_steer: capture_pending_steer(&active.pending_steer)?,
+                    pending_live_steer: capture_pending_live_steer(&active.pending_live_steer)?,
+                    live_steer_count: active.live_steer_count,
                     model_input_ready: active.model_input_ready,
                     output_limit_retries: active.output_limit_retries,
                 }))
@@ -124,6 +130,8 @@ impl CheckpointTurnState {
                 phase,
                 queued,
                 pending_steer,
+                pending_live_steer,
+                live_steer_count,
                 model_input_ready,
                 output_limit_retries,
             } => {
@@ -140,6 +148,8 @@ impl CheckpointTurnState {
                     iterations,
                     phase,
                     pending_steer: restore_pending_steer(pending_steer)?,
+                    pending_live_steer: restore_pending_live_steer(pending_live_steer)?,
+                    live_steer_count,
                     model_input_ready,
                     output_limit_retries,
                 }))
@@ -416,6 +426,63 @@ fn restore_pending_steer(
     messages
         .into_iter()
         .map(|message| message.restore_visible_user("pending steering"))
+        .collect()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointPendingLiveSteer {
+    action_id: String,
+    completion_action_id: String,
+    message: CheckpointStoredMessage,
+}
+
+fn capture_pending_live_steer(
+    steers: &[PendingLiveSteer],
+) -> Result<Vec<CheckpointPendingLiveSteer>, String> {
+    steers
+        .iter()
+        .map(|steer| {
+            validate_identity(&steer.action_id, "pending live steer action ID")?;
+            validate_identity(
+                &steer.completion_action_id,
+                "pending live steer completion action ID",
+            )?;
+            validate_non_empty_content(&steer.content, "pending live steer content")
+                .map_err(|error| error.detail().to_string())?;
+            Ok(CheckpointPendingLiveSteer {
+                action_id: steer.action_id.clone(),
+                completion_action_id: steer.completion_action_id.clone(),
+                message: CheckpointStoredMessage::capture_visible_user(
+                    &StoredMessage::visible(Message::user(steer.content.clone())),
+                    "pending live steer",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn restore_pending_live_steer(
+    steers: Vec<CheckpointPendingLiveSteer>,
+) -> Result<Vec<PendingLiveSteer>, String> {
+    steers
+        .into_iter()
+        .map(|steer| {
+            validate_identity(&steer.action_id, "pending live steer action ID")?;
+            validate_identity(
+                &steer.completion_action_id,
+                "pending live steer completion action ID",
+            )?;
+            let message = steer.message.restore_visible_user("pending live steer")?;
+            let Message::User { content } = message.message else {
+                return Err("pending live steer must contain a visible user message".to_string());
+            };
+            Ok(PendingLiveSteer {
+                action_id: steer.action_id,
+                completion_action_id: steer.completion_action_id,
+                content,
+            })
+        })
         .collect()
 }
 

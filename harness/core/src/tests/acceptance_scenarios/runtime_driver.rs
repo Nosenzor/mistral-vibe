@@ -1086,6 +1086,12 @@ fn pending_action_inspection(action: &Value) -> Value {
             "purpose": action["purpose"],
             "action_id": action["action_id"],
         }),
+        Some("live_steer") => json!({
+            "type": "live_steer",
+            "action_id": action["action_id"],
+            "turn_id": action["turn_id"],
+            "completion_action_id": action["completion_action_id"],
+        }),
         Some("runtime_builtin_tool_call") => json!({
             "type": "runtime_builtin_tool_call",
             "action_id": action["action_id"],

@@ -223,6 +223,18 @@ pub(crate) enum HarnessCommand {
         #[serde(default)]
         reason: Option<String>,
     },
+    LiveSteerAccepted {
+        action_id: String,
+        turn_id: String,
+        content: Vec<ContentBlock>,
+    },
+    LiveSteerDeclined {
+        action_id: String,
+        turn_id: String,
+        content: Vec<ContentBlock>,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 impl HarnessCommand {
@@ -241,6 +253,8 @@ impl HarnessCommand {
             }
             Self::CompletionSucceeded { .. } => "completion_succeeded",
             Self::CompletionFailed { .. } => "completion_failed",
+            Self::LiveSteerAccepted { .. } => "live_steer_accepted",
+            Self::LiveSteerDeclined { .. } => "live_steer_declined",
             Self::HookCompleted { .. } => "hook_completed",
             Self::HookFailed { .. } => "hook_failed",
             Self::ToolSucceeded { .. } => "tool_succeeded",
@@ -259,6 +273,8 @@ impl HarnessCommand {
             | Self::CompletionModelInputResyncRequested { action_id }
             | Self::CompletionSucceeded { action_id, .. }
             | Self::CompletionFailed { action_id, .. }
+            | Self::LiveSteerAccepted { action_id, .. }
+            | Self::LiveSteerDeclined { action_id, .. }
             | Self::HookCompleted { action_id, .. }
             | Self::HookFailed { action_id, .. }
             | Self::ToolSucceeded { action_id, .. }
@@ -311,6 +327,11 @@ pub(crate) enum PendingActionInspection {
     Completion {
         purpose: PendingCompletionPurpose,
         action_id: String,
+    },
+    LiveSteer {
+        action_id: String,
+        turn_id: String,
+        completion_action_id: String,
     },
     RuntimeBuiltinToolCall {
         action_id: String,

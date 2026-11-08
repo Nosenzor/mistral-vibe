@@ -269,6 +269,11 @@ fn collect_tool_execution_action_ids(
                     "pending tool checkpoint cannot contain a filesystem action".to_string()
                 );
             }
+            Action::LiveSteer { .. } => {
+                return Err(
+                    "pending tool checkpoint cannot contain a live steer action".to_string()
+                );
+            }
         }
     }
     Ok(())

@@ -242,6 +242,8 @@ fn awaiting_state(compaction: Option<CompactionFixturePhase>) -> HarnessState {
         iterations,
         phase,
         pending_steer: Vec::new(),
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: false,
         output_limit_retries: 0,
     });
@@ -281,6 +283,8 @@ fn pre_agent_hook_state() -> HarnessState {
             },
         },
         pending_steer: Vec::new(),
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: false,
         output_limit_retries: 0,
     });
@@ -317,6 +321,8 @@ fn completion_hook_state(point: HookPoint) -> HarnessState {
         iterations: 2,
         phase: ActivePhase::AwaitingHook { pending },
         pending_steer: Vec::new(),
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: false,
         output_limit_retries: 0,
     });
@@ -366,6 +372,8 @@ fn tool_batch_state() -> HarnessState {
         pending_steer: vec![StoredMessage::visible(Message::user_text(
             "steer after the current batch",
         ))],
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: false,
         output_limit_retries: 0,
     });
@@ -399,6 +407,8 @@ fn skill_read_state() -> HarnessState {
             },
         },
         pending_steer: Vec::new(),
+        pending_live_steer: Vec::new(),
+        live_steer_count: 0,
         model_input_ready: false,
         output_limit_retries: 0,
     });

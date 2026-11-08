@@ -267,6 +267,7 @@ pub(crate) fn test_model_facts() -> ModelFacts {
         compaction_threshold_max: 238_144,
         input_modalities: vec![InputModality::Text, InputModality::Image],
         image_cost: ImageCostRule::Fixed { tokens: 8_192 },
+        live_steer: false,
     }
 }
 

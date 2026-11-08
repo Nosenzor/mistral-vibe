@@ -30,6 +30,11 @@ pub(crate) fn hook(subject_action_id: &str, point: &str) -> String {
     derive("hook", &[subject_action_id, point])
 }
 
+pub(crate) fn live_steer(turn_id: &str, completion_action_id: &str, steer_index: u64) -> String {
+    let steer_index = steer_index.to_string();
+    derive("live_steer", &[turn_id, completion_action_id, &steer_index])
+}
+
 pub(crate) fn filesystem(operation: &str, origin: &str, operation_id: &str) -> String {
     derive("filesystem", &[operation, origin, operation_id])
 }

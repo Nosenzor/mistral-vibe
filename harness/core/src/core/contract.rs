@@ -37,7 +37,8 @@ fn core_emits_completion_actions_without_an_llm_context_payload() {
             | Action::Approval { .. }
             | Action::ProvidedTool { .. }
             | Action::Hook { .. }
-            | Action::Filesystem { .. } => None,
+            | Action::Filesystem { .. }
+            | Action::LiveSteer { .. } => None,
         })
         .collect::<Vec<_>>();
     assert!(

@@ -155,6 +155,14 @@ pub(crate) enum Observation {
         turn_id: String,
         content: Vec<ContentBlock>,
     },
+    LiveSteerAccepted {
+        turn_id: String,
+        content: Vec<ContentBlock>,
+    },
+    LiveSteerDeclined {
+        turn_id: String,
+        content: Vec<ContentBlock>,
+    },
     NotificationReceived {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,

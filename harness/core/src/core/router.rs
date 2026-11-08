@@ -118,6 +118,34 @@ pub(crate) fn reduce(
             },
             determinism,
         ),
+        HarnessCommand::LiveSteerAccepted {
+            action_id,
+            turn_id,
+            content,
+        } => dispatch(
+            state,
+            TurnEvent::LiveSteerAccepted {
+                action_id,
+                turn_id,
+                content,
+            },
+            determinism,
+        ),
+        HarnessCommand::LiveSteerDeclined {
+            action_id,
+            turn_id,
+            content,
+            reason,
+        } => dispatch(
+            state,
+            TurnEvent::LiveSteerDeclined {
+                action_id,
+                turn_id,
+                content,
+                reason,
+            },
+            determinism,
+        ),
         HarnessCommand::HookCompleted { action_id, result } => dispatch(
             state,
             TurnEvent::Hook {
@@ -218,7 +246,8 @@ pub(crate) fn normalize_command(state: &HarnessState, command: &mut HarnessComma
             | Action::RuntimeBuiltinTool { .. }
             | Action::ProvidedTool { .. }
             | Action::Hook { .. }
-            | Action::Filesystem { .. } => None,
+            | Action::Filesystem { .. }
+            | Action::LiveSteer { .. } => None,
         })
     else {
         return;
