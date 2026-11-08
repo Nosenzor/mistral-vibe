@@ -2511,3 +2511,26 @@ async def test_peer_stop_unknown_run_is_rejected() -> None:
 
 def test_peer_run_methods_are_advertised() -> None:
     assert {"peer/run", "peer/agent", "peer/stop"} <= set(SERVER_METHODS)
+
+
+@pytest.mark.asyncio
+async def test_peer_run_has_no_watchtimer() -> None:
+    # The call is slower than peer_review.timeout_seconds: the review loop
+    # would time it out, a run/agent task must not.
+    backend = _SlowBackend([_verdict_chunk(text="slow but done")], delay=0.5)
+    controller, notify, ports, _, _ = _make_loop(
+        _config(utility_models={"peer": "beta"}, peer_review={"timeout_seconds": 0.2}),
+        backend,
+    )
+
+    response = await controller.run(
+        PeerRunParams(session_id="session-1", prompt="long research"),
+        PeerRunKind.AGENT,
+        ports,
+    )
+    state = controller._sessions["session-1"]
+    task = state.runs[response.run_id].task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
+    assert state.runs[response.run_id].status is PeerRunStatus.COMPLETE
+    assert "slow but done" in _results(notify)[-1].text

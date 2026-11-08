@@ -754,7 +754,9 @@ class PeerReviewController:
         try:
             messages: list[LLMMessage] = list(run.transcript)
             messages.append(LLMMessage(role=Role.user, content=run.prompt))
-            text = await self._complete_with_tools(state, config, model, messages)
+            # Run/agent tasks are explicit user requests: no watchtimer, they
+            # run until done or /peer stop cancels them.
+            text = await self._complete_with_tools(state, config, model, messages, None)
             run.transcript = messages
             run.status = PeerRunStatus.COMPLETE
             run.text = text.strip() or "No answer."
@@ -1182,7 +1184,9 @@ class PeerReviewController:
             LLMMessage(role=Role.system, content=UtilityPrompt.PEER_REVIEW.read()),
             LLMMessage(role=Role.user, content=_build_context(state, mirror)),
         ]
-        content = await self._complete_with_tools(state, config, model, messages)
+        content = await self._complete_with_tools(
+            state, config, model, messages, config.peer_review.timeout_seconds
+        )
         return _parse_verdict(content)
 
     async def _complete_with_tools(
@@ -1191,11 +1195,14 @@ class PeerReviewController:
         config: VibeConfigSchema,
         model: ModelConfig,
         messages: list[LLMMessage],
+        timeout_seconds: float | None,
     ) -> str:
         """One duck completion with a capped, serialized read-only tool loop.
 
         Shared by the review loop and direct `/peer run` / `/peer agent` tasks.
-        Returns the final message's text.
+        Returns the final message's text. ``timeout_seconds`` bounds each
+        completion and tool call; ``None`` leaves them unbounded, which is what
+        explicit run/agent tasks use — only the passive review loop is timed.
         """
         ports = state.ports
         if ports is None:
@@ -1211,7 +1218,7 @@ class PeerReviewController:
                 # The timeout bounds one completion, not the whole review: a
                 # hung call fails after `timeout_seconds`, while a healthy
                 # multi-round review may span several timeout periods.
-                async with asyncio.timeout(config.peer_review.timeout_seconds):
+                async with asyncio.timeout(timeout_seconds):
                     chunk = await backend.complete(
                         model=model,
                         messages=messages,
@@ -1238,7 +1245,7 @@ class PeerReviewController:
                 )
                 for call in tool_calls:
                     result = await self._execute_tool_call(
-                        executor, call, config.peer_review.timeout_seconds
+                        executor, call, timeout_seconds
                     )
                     messages.append(
                         LLMMessage(
@@ -1250,7 +1257,10 @@ class PeerReviewController:
                     )
 
     async def _execute_tool_call(
-        self, executor: PeerReviewToolExecutor, call: ToolCall, timeout_seconds: float
+        self,
+        executor: PeerReviewToolExecutor,
+        call: ToolCall,
+        timeout_seconds: float | None,
     ) -> str:
         """Run one duck tool call; errors are fed back so the review continues."""
         name = call.function.name or ""
@@ -1265,6 +1275,8 @@ class PeerReviewController:
             async with asyncio.timeout(timeout_seconds):
                 return await executor.execute(name, arguments)
         except TimeoutError:
+            if timeout_seconds is None:
+                return f"Error: '{name}' timed out"
             return f"Error: '{name}' timed out after {timeout_seconds:g}s"
         except ToolError as exc:
             return f"Error: {exc}"
